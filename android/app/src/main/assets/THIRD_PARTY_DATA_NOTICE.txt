@@ -1,0 +1,94 @@
+Agent Keyboard bundled Chinese pinyin dictionary data
+=====================================================
+
+CC-CEDICT
+---------
+Source: MDBG CC-CEDICT, https://www.mdbg.net/chinese/dictionary?page=cc-cedict
+Referenced work: CEDICT, Copyright (C) 1997, 1998 Paul Andrew Denisowski
+License: Creative Commons Attribution-ShareAlike 4.0 International
+https://creativecommons.org/licenses/by-sa/4.0/
+
+The bundled pinyin dictionary is an adapted database derived from CC-CEDICT.
+It contains filtered and normalized simplified entries and pinyin; tone marks
+are removed, entries are joined with word-frequency data, and ranking weights
+are calculated. This adapted database is distributed under CC BY-SA 4.0.
+Attribution: CC-CEDICT, published by MDBG; referenced work by Paul Andrew
+Denisowski. Changes: filtering, normalization, frequency enrichment, and
+ranking-weight calculation.
+
+Jieba word-frequency dictionary
+-------------------------------
+Source: https://github.com/fxsjy/jieba
+File: jieba/dict.txt
+Commit: 67fa2e36e72f69d9134b8a1037b83fbb070b9775
+SHA-256: 7197C3211DDD98962B036CDF40324D1EA2BFAA12BD028E68FAA70111A88E12A8
+
+The upstream README and LICENSE state that Jieba is distributed under the MIT
+License. The bundled pinyin entries use Jieba word frequencies to calculate
+local candidate-ranking weights.
+The upstream dictionary file does not separately document the provenance or
+license of its underlying frequency corpus; public redistribution requires
+verification of those data rights.
+
+Copyright (c) 2013 Sun Junyi
+
+The MIT License (MIT)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+THUOCL
+------
+Source: https://github.com/thunlp/THUOCL
+Commit: a30ce79d895d01ab5132a5c74c29703ff7efb4cc
+Archive SHA-256: 0C710AEAF9B75B345C944C3C4F625BB4C8135EE97518DC5BE5F444BF5ED1F89B
+License: MIT License
+
+Copyright (c) 2018 THUNLP
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+THUOCL word-document-frequency values are used as an additional ranking
+signal. The THUOCL README states that the lexicon is freely available for
+research and commercial use. It requests the following acknowledgment and
+citation when publishing research results based on THUOCL:
+
+"使用了清华大学开放中文词库"
+
+Han Shiyi, Zhang Yuhui, Ma Yunshan, Tu Cunchao, Guo Zhipeng, Liu Zhiyuan,
+Sun Maosong. THUOCL: Tsinghua Open Chinese Lexicon. 2016.
+
+Complete source versions, checksums, filtering rules, and rebuild instructions
+are recorded in docs/third-party-data-inventory.md. The third-party data
+inventory also records unresolved provenance questions for source corpora.

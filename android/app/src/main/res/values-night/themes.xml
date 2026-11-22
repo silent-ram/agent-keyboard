@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- M3-C 评审 P3:深色系统(-night)下使用 Material 深色 NoActionBar,启动帧不再闪白 -->
+<resources>
+    <style name="Theme.AgentKeyboard" parent="@android:style/Theme.Material.NoActionBar" />
+</resources>

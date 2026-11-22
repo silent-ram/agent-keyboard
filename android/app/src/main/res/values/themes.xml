@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- M3-C 评审 P3:启动主题 DayNight 化(替代 Manifest 直连 Theme.Material.Light)——
+     浅色套;深色变体见 values-night/themes.xml,消除深色系统下的启动白帧闪烁 -->
+<resources>
+    <style name="Theme.AgentKeyboard" parent="@android:style/Theme.Material.Light.NoActionBar" />
+</resources>

@@ -1,0 +1,12 @@
+# id	category	pinyin_input	expected_transcription	baseline_top1	baseline_top5
+short_hello	short	nihao	你好	true	true
+short_project	short	xiangmu	项目	true	true
+long_meeting	long	jintianhuiyi	今天会议	false	false
+long_work_query	long	woxiangchaxunxiangmu	我想查询项目	false	false
+typo_transpose	typo	jintain	今天	false	false
+typo_missing	typo	jntian	今天	false	false
+fuzzy_zh_z	fuzzy	zidao	知道	true	true
+abbreviation	abbreviation	jtk	今天开会	false	false
+mixed_ascii	mixed	nihaoABC123	你好ABC123	false	false
+mixed_email	mixed	xiangmuemail	项目email	false	false
+partial_syllable	partial	ni	你	true	true

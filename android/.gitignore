@@ -1,0 +1,23 @@
+# Gradle
+.gradle/
+build/
+app/src/main/assets/usr/
+app/src/main/assets/descriptor.json
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Android Studio 本机配置(不入库)
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 系统
+.DS_Store
+
+# 验收截图(P3,不入库)
+screenshots/

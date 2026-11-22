@@ -1,0 +1,7 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 仅 debug 构建:允许明文 HTTP,供本机回环 stub 模型服务(10.0.2.2/127.0.0.1)
+         实测使用;release 构建不受影响(仍由平台默认策略禁明文)。 -->
+    <application android:usesCleartextTraffic="true" />
+
+</manifest>

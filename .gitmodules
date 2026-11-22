@@ -1,0 +1,3 @@
+[submodule "third_party/fcitx5-android"]
+	path = third_party/fcitx5-android
+	url = https://github.com/silent-ram/agent-keyboard-fcitx5-android.git

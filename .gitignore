@@ -1,0 +1,25 @@
+# 根级兜底(细粒度规则见 android/.gitignore)
+.gradle/
+local.properties
+*.apk
+*.aab
+*.idsig
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.akcfg
+.env
+.env.*
+!.env.example
+.DS_Store
+
+# 会话工具产物
+.mimosa/
+/.workbuddy/
+/artifacts/
+
+# 本机调研、IDE 与 Gradle 状态
+/.research/
+/.idea/
+/android/.kotlin/
