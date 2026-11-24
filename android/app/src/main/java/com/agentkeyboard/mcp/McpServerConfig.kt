@@ -54,6 +54,19 @@ object McpServerConfigJson {
         }
     }
 
+    /**
+     * MCP 服务地址校验:按 URI 解析,scheme 仅 http/https(与模型地址口径一致),必须有 host,
+     * 拒绝 userInfo(`user:pass@host` 会把凭据放进 URL 与日志)和 fragment。
+     */
+    fun isValidServerUrl(raw: String): Boolean {
+        val url = raw.trim()
+        if (url.isEmpty() || url.any(Char::isWhitespace)) return false
+        val uri = runCatching { java.net.URI(url) }.getOrNull() ?: return false
+        val scheme = uri.scheme?.lowercase() ?: return false
+        return (scheme == "https" || scheme == "http") &&
+            !uri.host.isNullOrBlank() && uri.rawUserInfo == null && uri.rawFragment == null
+    }
+
     /** server id slug:[a-z0-9-],用于工具 id 与权限 key;空结果回退 "server"。 */
     fun slug(raw: String): String =
         raw.lowercase()

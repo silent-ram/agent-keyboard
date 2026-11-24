@@ -54,6 +54,9 @@ class McpClient(
 
         /** MCP 文本结果预算:超出截断并标注,防超长结果挤爆上下文窗口。 */
         const val MAX_RESULT_CHARS = 16_000
+
+        /** 服务端错误文本上限:错误同样回喂模型,不能成为绕过结果预算的通道。 */
+        const val MAX_ERROR_CHARS = 2_000
         private const val HEADER_SESSION_ID = "mcp-session-id"
     }
 
@@ -96,7 +99,7 @@ class McpClient(
                 val result = rpc(serverUrl, authHeader, "tools/call", params, sessionId)
                 val text = extractText(result)
                 if (result.optBoolean("isError", false)) {
-                    ToolResult.error("MCP 工具返回错误:$text", ToolErrorCodes.REMOTE_ERROR)
+                    ToolResult.error("MCP 工具返回错误:${text.take(MAX_ERROR_CHARS)}", ToolErrorCodes.REMOTE_ERROR)
                 } else {
                     val clipped = if (text.length > MAX_RESULT_CHARS) {
                         text.take(MAX_RESULT_CHARS) + "\n…(MCP 结果过长,已截断)"
@@ -126,10 +129,10 @@ class McpClient(
                 "clientInfo",
                 JSONObject().put("name", CLIENT_NAME).put("version", CLIENT_VERSION),
             )
-        val initResponse = rawRequest(serverUrl, authHeader, "initialize", initParams, null)
+        val (initId, initResponse) = rawRequest(serverUrl, authHeader, "initialize", initParams, null)
         val sessionId = initResponse.headers[HEADER_SESSION_ID]
-        // initialize 的业务错误在 decode 时抛出;先确认握手有效再发通知
-        decodeRpcBody(initResponse.body, expectedId = ids.get())
+        // 先确认握手有效(id 匹配且无 JSON-RPC error)再发通知
+        unwrapResult(decodeRpcBody(initResponse.body, expectedId = initId), "initialize")
         // 通知无 id,202/空体/JSON 均合法;失败不阻断后续调用(server 实现差异);取消必须传播
         try {
             notify(serverUrl, authHeader, "notifications/initialized", sessionId)
@@ -138,7 +141,12 @@ class McpClient(
         } catch (e: Exception) {
             // 通知失败容忍:不同 server 实现对 initialized 通知的处理不一致
         }
-        return block(sessionId)
+        return try {
+            block(sessionId)
+        } catch (e: org.json.JSONException) {
+            // 服务端结构不合规(缺 name、content 项不是对象等):统一成稳定错误码,不让原始异常逃逸
+            throw McpException(ToolErrorCodes.BAD_RESPONSE, false, "响应结构不符合 MCP 规范")
+        }
     }
 
     private suspend fun rpc(
@@ -148,12 +156,16 @@ class McpClient(
         params: JSONObject?,
         sessionId: String?,
     ): JSONObject {
-        val response = rawRequest(serverUrl, authHeader, method, params, sessionId)
-        val message = decodeRpcBody(response.body, expectedId = ids.get())
+        // 用本次请求自己的 id 解码:读共享计数器的"当前值"在并发请求下会错配(后台同步与工具调用重叠)
+        val (id, response) = rawRequest(serverUrl, authHeader, method, params, sessionId)
+        return unwrapResult(decodeRpcBody(response.body, expectedId = id), method)
+    }
+
+    private fun unwrapResult(message: JSONObject, method: String): JSONObject {
         val error = message.optJSONObject("error")
         if (error != null) {
             val code = error.optInt("code", 0)
-            val msg = error.optString("message").ifBlank { "未知 JSON-RPC 错误" }
+            val msg = error.optString("message").ifBlank { "未知 JSON-RPC 错误" }.take(MAX_ERROR_CHARS)
             throw McpException(ToolErrorCodes.REMOTE_ERROR, false, "RPC $code: $msg")
         }
         return message.optJSONObject("result")
@@ -174,7 +186,7 @@ class McpClient(
         method: String,
         params: JSONObject?,
         sessionId: String?,
-    ): HttpResponse {
+    ): Pair<Long, HttpResponse> {
         val id = ids.incrementAndGet()
         val body = JSONObject()
             .put("jsonrpc", "2.0")
@@ -182,7 +194,7 @@ class McpClient(
             .put("method", method)
             .apply { params?.let { put("params", it) } }
             .toString()
-        return post(serverUrl, authHeader, body, sessionId)
+        return id to post(serverUrl, authHeader, body, sessionId)
     }
 
     private suspend fun post(
@@ -252,6 +264,12 @@ class McpClient(
             } catch (e: Exception) {
                 throw McpException(ToolErrorCodes.BAD_RESPONSE, false, "响应不是合法 JSON")
             }
+            // 纯 JSON 响应同样校验 id;id 为 null 仅在 JSON-RPC 解析错误时合法(此时必带 error)
+            val idMatches = when {
+                !json.has("id") || json.isNull("id") -> json.has("error")
+                else -> json.optLong("id", -1L) == expectedId
+            }
+            if (!idMatches) throw McpException(ToolErrorCodes.BAD_RESPONSE, false, "响应 id 与请求不匹配")
             return json
         }
         // SSE 帧:event 行忽略,data 行(同一 event 多行)以 \n 拼接,空行分帧

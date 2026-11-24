@@ -9,6 +9,25 @@ import org.junit.Test
 /** MCP 配置 JSON 与工具 id 契约(纯 JVM)。 */
 class McpServerConfigTest {
 
+    @org.junit.Test
+    fun `isValidServerUrl - 接受 https 与 http 地址`() {
+        org.junit.Assert.assertTrue(McpServerConfigJson.isValidServerUrl("https://mcp.example.com/mcp"))
+        org.junit.Assert.assertTrue(McpServerConfigJson.isValidServerUrl("  http://192.168.1.10:8080/mcp "))
+    }
+
+    @org.junit.Test
+    fun `isValidServerUrl - 拒绝凭据内嵌 fragment 缺 host 和非 http scheme`() {
+        listOf(
+            "",
+            "mcp.example.com/mcp",
+            "ftp://mcp.example.com",
+            "https://user:secret@mcp.example.com/mcp",
+            "https://mcp.example.com/mcp#frag",
+            "https:///mcp",
+            "https://mcp.example.com/a b",
+        ).forEach { org.junit.Assert.assertFalse(it, McpServerConfigJson.isValidServerUrl(it)) }
+    }
+
     @Test
     fun `配置编解码 roundtrip`() {
         val servers = listOf(

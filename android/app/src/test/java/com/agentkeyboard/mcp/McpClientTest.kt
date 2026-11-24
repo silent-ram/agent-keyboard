@@ -168,6 +168,58 @@ class McpClientTest {
     }
 
     @Test
+    fun `decodeRpcBody - 纯 JSON 响应 id 不匹配抛 BAD_RESPONSE`() {
+        val client = McpClient(FakeMcpServer())
+        try {
+            client.decodeRpcBody("""{"jsonrpc":"2.0","id":3,"result":{}}""", expectedId = 4)
+            fail("应抛 McpException")
+        } catch (e: McpException) {
+            assertEquals(ToolErrorCodes.BAD_RESPONSE, e.code)
+        }
+    }
+
+    @Test
+    fun `listTools - 工具缺少 name 转 BAD_RESPONSE 而非抛 JSONException`() = runBlocking {
+        val transport = HttpTransport { request ->
+            val body = JSONObject(request.body!!)
+            if (!body.has("id")) return@HttpTransport HttpResponse(202, "")
+            val id = body.getLong("id")
+            val result = if (body.getString("method") == "tools/list") {
+                """{"tools":[{"description":"no name"}]}"""
+            } else {
+                "{}"
+            }
+            HttpResponse(200, """{"jsonrpc":"2.0","id":$id,"result":$result}""")
+        }
+        try {
+            McpClient(transport).listTools("https://mcp.example.com/mcp", null)
+            fail("应抛 McpException")
+        } catch (e: McpException) {
+            assertEquals(ToolErrorCodes.BAD_RESPONSE, e.code)
+        }
+    }
+
+    @Test
+    fun `callTool - content 项不是对象时返回 BAD_RESPONSE 结果`() = runBlocking {
+        val server = FakeMcpServer(callContentJson = """["plain string"]""")
+        val r = McpClient(server).callTool("https://mcp.example.com/mcp", null, "t", "{}")
+        assertFalse(r.ok)
+        assertEquals(ToolErrorCodes.BAD_RESPONSE, r.errorCode)
+    }
+
+    @Test
+    fun `callTool - isError 文本超长被截断`() = runBlocking {
+        val long = "x".repeat(McpClient.MAX_ERROR_CHARS * 3)
+        val server = FakeMcpServer(
+            callContentJson = """[{"type":"text","text":"$long"}]""",
+            callIsError = true,
+        )
+        val r = McpClient(server).callTool("https://mcp.example.com/mcp", null, "t", "{}")
+        assertFalse(r.ok)
+        assertTrue(r.raw.length < McpClient.MAX_ERROR_CHARS + 100)
+    }
+
+    @Test
     fun `decodeRpcBody - 坏 JSON 抛 BAD_RESPONSE`() {
         val client = McpClient(FakeMcpServer())
         try {

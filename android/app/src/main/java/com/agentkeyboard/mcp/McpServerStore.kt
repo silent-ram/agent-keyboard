@@ -28,7 +28,8 @@ class McpServerStore(private val context: Context) {
 
     /** 添加 server;authHeaderPlain 为空串/null 表示无鉴权。返回新建配置。 */
     suspend fun add(name: String, url: String, authHeaderPlain: String?): McpServerConfig {
-        require(url.startsWith("https://") || url.startsWith("http://")) { "MCP server 仅支持 http(s) URL" }
+        require(McpServerConfigJson.isValidServerUrl(url)) { "MCP server 地址无效" }
+        require(name.isNotBlank()) { "MCP server 名称不能为空" }
         val encrypted = authHeaderPlain
             ?.takeIf { it.isNotBlank() }
             ?.let { withContext(Dispatchers.IO) { SecureStore.encryptSecret(it) } }
@@ -38,19 +39,27 @@ class McpServerStore(private val context: Context) {
             url = url.trim(),
             authHeaderEnc = encrypted,
         )
-        val updated = list() + config
-        context.mcpDataStore.edit { it[Keys.SERVERS_JSON] = McpServerConfigJson.encode(updated) }
+        update { it + config }
         return config
     }
 
     suspend fun delete(serverId: String) {
-        val updated = list().filterNot { it.id == serverId }
-        context.mcpDataStore.edit { it[Keys.SERVERS_JSON] = McpServerConfigJson.encode(updated) }
+        update { servers -> servers.filterNot { it.id == serverId } }
     }
 
     suspend fun setEnabled(serverId: String, enabled: Boolean) {
-        val updated = list().map { if (it.id == serverId) it.copy(enabled = enabled) else it }
-        context.mcpDataStore.edit { it[Keys.SERVERS_JSON] = McpServerConfigJson.encode(updated) }
+        update { servers -> servers.map { if (it.id == serverId) it.copy(enabled = enabled) else it } }
+    }
+
+    /**
+     * 读-改-写在同一个 DataStore 事务内完成。旧实现先 list() 再 edit{} 写回整表,
+     * 两个操作并发(如连点开关、添加时同步回调)会互相覆盖,丢失其中一次修改。
+     */
+    private suspend fun update(transform: (List<McpServerConfig>) -> List<McpServerConfig>) {
+        context.mcpDataStore.edit { prefs ->
+            val current = McpServerConfigJson.decode(prefs[Keys.SERVERS_JSON])
+            prefs[Keys.SERVERS_JSON] = McpServerConfigJson.encode(transform(current))
+        }
     }
 
     /** 解密 Authorization(每次调用时解密,不驻留);未配置或解密失败返回 null。 */
