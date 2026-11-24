@@ -779,6 +779,68 @@ class AgentRuntimeTest {
     }
 
     @Test
+    fun `LLM限流429 - 退避重试后成功`() { runBlocking {
+        val h = Harness()
+        var calls = 0
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val engine = h.buildEngine(scope, llm = { _, _, _, _, _, _, _ ->
+            calls++
+            if (calls <= 2) {
+                throw com.openai.errors.RateLimitException.builder()
+                    .headers(com.openai.core.http.Headers.builder().build())
+                    .build()
+            }
+            ToolCallResult.Content("限流后成功")
+        })
+        val job = engine.start(Task(TaskType.ASK, "问"))
+        withTimeout(5000) { job.join() }
+        assertEquals(3, calls)
+        assertEquals(SessionStatus.DONE, h.sessionDao.sessions[0].status)
+        scope.coroutineContext[Job]?.cancelChildren()
+    }
+    }
+
+    @Test
+    fun `LLM返回401 - 不重试直接Failed`() { runBlocking {
+        val h = Harness()
+        var calls = 0
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val engine = h.buildEngine(scope, llm = { _, _, _, _, _, _, _ ->
+            calls++
+            throw com.openai.errors.UnauthorizedException.builder()
+                .headers(com.openai.core.http.Headers.builder().build())
+                .build()
+        })
+        val job = engine.start(Task(TaskType.ASK, "问"))
+        withTimeout(5000) { job.join() }
+        assertEquals(1, calls)
+        assertEquals(SessionStatus.FAILED, h.sessionDao.sessions[0].status)
+        scope.coroutineContext[Job]?.cancelChildren()
+    }
+    }
+
+    @Test
+    fun `回答被截断 - 保留内容但以未完成结束`() { runBlocking {
+        val h = Harness()
+        h.llmScript += ToolCallResult.Content("半截回答", incompleteReason = "回答达到模型输出长度上限，内容可能不完整")
+        val events = mutableListOf<AgentEvent>()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val engine = h.buildEngine(scope)
+        val collectJob = scope.launch { engine.events.collect { events += it } }
+        val job = engine.start(Task(TaskType.ASK, "问"))
+        withTimeout(5000) { job.join() }
+        delay(100)
+        val incomplete = events.filterIsInstance<AgentEvent.Incomplete>().single()
+        assertEquals("半截回答", incomplete.content)
+        assertTrue(incomplete.reason.contains("长度上限"))
+        assertTrue(events.none { it is AgentEvent.Finished })
+        assertEquals(SessionStatus.INCOMPLETE, h.sessionDao.sessions[0].status)
+        assertTrue(h.messageDao.messages.any { it.role == MessageRoles.ASSISTANT })
+        collectJob.cancel(); scope.coroutineContext[Job]?.cancelChildren()
+    }
+    }
+
+    @Test
     fun `取消 - 会话 STOPPED 且落盘停止注记`() { runBlocking {
         val h = Harness()
         val release = CompletableDeferred<Unit>()

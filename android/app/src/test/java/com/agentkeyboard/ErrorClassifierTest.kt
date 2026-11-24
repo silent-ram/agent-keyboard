@@ -105,6 +105,28 @@ class ErrorClassifierTest {
     }
 
     @Test
+    fun isRetryable_timeoutRateLimitAndTransientServerErrors() {
+        val headers = com.openai.core.http.Headers.builder().build()
+        assertTrue(ErrorClassifier.isRetryable(SocketTimeoutException("t")))
+        assertTrue(ErrorClassifier.isRetryable(com.openai.errors.RateLimitException.builder().headers(headers).build()))
+        for (code in listOf(500, 502, 503, 504)) {
+            val e = com.openai.errors.InternalServerException.builder().statusCode(code).headers(headers).build()
+            assertTrue("status $code", ErrorClassifier.isRetryable(e))
+            // 包装后仍可识别
+            assertTrue(ErrorClassifier.isRetryable(RuntimeException("wrap", e)))
+        }
+    }
+
+    @Test
+    fun isRetryable_callerErrorsAndUnknownFailuresAreNotRetried() {
+        val headers = com.openai.core.http.Headers.builder().build()
+        assertFalse(ErrorClassifier.isRetryable(com.openai.errors.UnauthorizedException.builder().headers(headers).build()))
+        assertFalse(ErrorClassifier.isRetryable(com.openai.errors.BadRequestException.builder().headers(headers).build()))
+        assertFalse(ErrorClassifier.isRetryable(RuntimeException("bad gateway")))
+        assertFalse(ErrorClassifier.isRetryable(EmptyResponseException()))
+    }
+
+    @Test
     fun isEmptyResponse_detectsTypedEmptyResponse() {
         // 直抛 / 包装均可识别;异常对象不携带中文 message,UI 不会外泄原始信息
         assertTrue(ErrorClassifier.isEmptyResponse(EmptyResponseException()))

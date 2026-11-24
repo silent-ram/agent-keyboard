@@ -30,7 +30,7 @@ object LlmClient {
             val client = OpenAIOkHttpClient.builder()
                 .baseUrl(baseUrl.trim())
                 .apiKey(apiKey)
-                .timeout(Duration.ofSeconds(TIMEOUT_SECONDS))
+                .timeout(EngineClient.requestTimeout())
                 .build()
             try {
                 val params = ChatCompletionCreateParams.builder()

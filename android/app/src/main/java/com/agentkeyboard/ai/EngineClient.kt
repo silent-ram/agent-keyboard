@@ -36,7 +36,8 @@ data class EngineToolCall(val id: String, val name: String, val argumentsJson: S
 
 /** LLM 单步结果:content(最终回答)或 toolCalls(继续工具循环) */
 sealed class ToolCallResult {
-    data class Content(val text: String) : ToolCallResult()
+    /** [incompleteReason] 非空 = 回答被截断或有分片丢失,内容可展示但不完整。 */
+    data class Content(val text: String, val incompleteReason: String? = null) : ToolCallResult()
     data class ToolCalls(val content: String, val calls: List<EngineToolCall>) : ToolCallResult()
 }
 
@@ -69,7 +70,23 @@ class StreamingHandle {
  */
 object EngineClient {
 
+    /** 流式两次数据块之间允许的最长空闲(读超时);不是整次请求上限。 */
     const val TIMEOUT_SECONDS = 60L
+    const val CONNECT_TIMEOUT_SECONDS = 15L
+    /** 整次请求上限:长回答逐块到达时不能被 60s 总时长掐断(SDK 的 timeout(Duration) 只设 request)。 */
+    const val REQUEST_TIMEOUT_SECONDS = 600L
+
+    /**
+     * openai-java 的 `timeout(Duration)` 只设置整次请求总时长(request),流式长回答超过 60s
+     * 会被中断并被当成超时重试,永远拿不到完整回答。这里分别设置连接、读(块间空闲)和总时长。
+     */
+    internal fun requestTimeout(): com.openai.core.Timeout = com.openai.core.Timeout.builder()
+        .connect(Duration.ofSeconds(CONNECT_TIMEOUT_SECONDS))
+        .read(Duration.ofSeconds(TIMEOUT_SECONDS))
+        .write(Duration.ofSeconds(TIMEOUT_SECONDS))
+        .request(Duration.ofSeconds(REQUEST_TIMEOUT_SECONDS))
+        .build()
+
     const val ROLE_SYSTEM = "system"
     const val ROLE_USER = "user"
     const val ROLE_ASSISTANT = "assistant"
@@ -92,7 +109,9 @@ object EngineClient {
         val client = com.openai.client.okhttp.OpenAIOkHttpClient.builder()
             .baseUrl(url)
             .apiKey(key)
-            .timeout(Duration.ofSeconds(TIMEOUT_SECONDS))
+            .timeout(requestTimeout())
+            // SDK 默认自带 2 次重试,与 AgentRuntime 的退避叠加后一步最多 12 次请求;重试只留一层
+            .maxRetries(0)
             .build()
         clients[url] = key to client
         return client
@@ -158,7 +177,10 @@ object EngineClient {
                 // (openai-java required accessor/反序列化抛异常),跳过该 chunk 继续读,
                 // 而不是让整个流失败(content 在坏 chunk 内的部分一并丢弃属可接受降级)
                 val applied = runCatching { agg.apply(iterator.next()) }
-                if (applied.isFailure) continue
+                if (applied.isFailure) {
+                    agg.markDropped() // 计数:有丢失时结果标为不完整,不悄悄当作完整回答
+                    continue
+                }
                 val (accumulated, hasNew) = applied.getOrThrow()
                 if (hasNew) onDelta(accumulated) // 累积文本回调(面板逐字/上屏)
             }
@@ -188,7 +210,15 @@ object EngineClient {
         } else {
             val text = message.content()?.orElse("").orEmpty()
             text.ifBlank { throw EmptyResponseException() }
-            ToolCallResult.Content(text)
+            val reason = choice.finishReason()
+            ToolCallResult.Content(
+                text,
+                incompleteReason(
+                    truncatedByLength = reason == ChatCompletion.Choice.FinishReason.LENGTH,
+                    filtered = reason == ChatCompletion.Choice.FinishReason.CONTENT_FILTER,
+                    droppedChunks = 0,
+                ),
+            )
         }
     }
 
@@ -200,6 +230,13 @@ object EngineClient {
         private val content = StringBuilder()
         private val calls = LinkedHashMap<String, Agg>()
         private var finishToolCalls = false
+        private var finishReason: ChatCompletionChunk.Choice.FinishReason? = null
+        private var droppedChunks = 0
+
+        /** 记录一个无法解析而被跳过的分片。 */
+        fun markDropped() {
+            droppedChunks++
+        }
 
         private data class Agg(val id: StringBuilder, val name: StringBuilder, val arguments: StringBuilder)
 
@@ -229,8 +266,11 @@ object EngineClient {
                         if (fargs != null) agg.arguments.append(fargs)
                     }
                 }
-                if (choice.finishReason() == ChatCompletion.Choice.FinishReason.TOOL_CALLS) {
-                    finishToolCalls = true
+                // chunk 的 finishReason 是 Optional<ChatCompletionChunk.Choice.FinishReason>;旧代码与
+                // ChatCompletion.Choice.FinishReason 比较,类型不同永远为假,长度截断从未被识别
+                choice.finishReason().orElse(null)?.let { reason ->
+                    finishReason = reason
+                    if (reason == ChatCompletionChunk.Choice.FinishReason.TOOL_CALLS) finishToolCalls = true
                 }
             }
             return content.toString() to hasContent
@@ -249,8 +289,23 @@ object EngineClient {
             }
             val text = content.toString()
             if (text.isBlank()) throw EmptyResponseException()
-            return ToolCallResult.Content(text)
+            return ToolCallResult.Content(
+                text,
+                incompleteReason(
+                    truncatedByLength = finishReason == ChatCompletionChunk.Choice.FinishReason.LENGTH,
+                    filtered = finishReason == ChatCompletionChunk.Choice.FinishReason.CONTENT_FILTER,
+                    droppedChunks = droppedChunks,
+                ),
+            )
         }
+    }
+
+    /** 回答不完整的用户可见原因;完整时返回 null。流式与非流式共用同一口径。 */
+    internal fun incompleteReason(truncatedByLength: Boolean, filtered: Boolean, droppedChunks: Int): String? = when {
+        truncatedByLength -> "回答达到模型输出长度上限，内容可能不完整"
+        filtered -> "回答被模型服务的内容过滤中断，内容可能不完整"
+        droppedChunks > 0 -> "有 $droppedChunks 段回答数据无法解析，内容可能不完整"
+        else -> null
     }
 
     private fun toParam(m: EngineMessage): ChatCompletionMessageParam = when (m.role) {

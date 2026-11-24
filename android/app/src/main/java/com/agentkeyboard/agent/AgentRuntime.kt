@@ -288,6 +288,8 @@ class AgentRuntime(
                         }
                         finalText = safety.displayAnswer(result.text)
                         persistAssistant(sessionId, step, finalText, null, citations)
+                        // 长度上限/内容过滤/分片丢失:保留已生成内容,但不能声称任务完整完成
+                        result.incompleteReason?.let { incompleteReason = it }
                         break
                     }
                     is ToolCallResult.ToolCalls -> {
@@ -550,7 +552,8 @@ class AgentRuntime(
             } catch (e: Exception) {
                 // 超时重试(M3:最多 3 次,指数退避 1s/2s/4s 再重发,降低限流/网络抖动
                 // 场景下的连续失败率);其余错误直接上抛 → Failed
-                if (ErrorClassifier.isTimedOut(e) && attempt < MAX_TIMEOUT_RETRIES) {
+                // 超时、限流(429)与服务端临时故障(5xx)同走退避;SDK 内置重试已关闭,此处是唯一重试层
+                if (ErrorClassifier.isRetryable(e) && attempt < MAX_TIMEOUT_RETRIES) {
                     retryDelay(backoffMs(attempt))
                     attempt++
                     continue

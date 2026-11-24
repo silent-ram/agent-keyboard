@@ -42,6 +42,13 @@ object ErrorClassifier {
         .firstOrNull()
         ?.statusCode()
 
+    /** 可重试的 HTTP 状态:请求超时、限流、服务端临时故障。401/403/400 等调用方错误重试也不会成功。 */
+    private val RETRYABLE_STATUS = setOf(408, 429, 500, 502, 503, 504)
+
+    /** 是否值得退避重试:超时,或服务端返回临时性错误状态。 */
+    fun isRetryable(t: Throwable): Boolean =
+        isTimedOut(t) || extractStatusCode(t)?.let { it in RETRYABLE_STATUS } == true
+
     /** 异常链中是否包含超时(OkHttp SocketTimeoutException,可能被包装) */
     fun isTimedOut(t: Throwable): Boolean = generateSequence(t as Throwable?) { it.cause }
         .any { it is SocketTimeoutException }

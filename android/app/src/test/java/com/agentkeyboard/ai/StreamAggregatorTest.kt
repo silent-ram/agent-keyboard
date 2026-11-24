@@ -67,5 +67,52 @@ class StreamAggregatorTest {
         assertFalse(hasNew)
     }
 
+    @Test
+    fun `正常 stop 结束 - 不标记为不完整`() {
+        val agg = EngineClient.StreamAggregator()
+        agg.apply(chunk("""{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"完整回答"},"finish_reason":"stop"}]}"""))
+        val r = agg.result() as ToolCallResult.Content
+        assertEquals("完整回答", r.text)
+        assertNull(r.incompleteReason)
+    }
+
+    @Test
+    fun `finish_reason length - 保留内容并标记长度截断`() {
+        val agg = EngineClient.StreamAggregator()
+        agg.apply(chunk("""{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"写到一半"},"finish_reason":null}]}"""))
+        agg.apply(chunk("""{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"""))
+        val r = agg.result() as ToolCallResult.Content
+        assertEquals("写到一半", r.text)
+        assertTrue(r.incompleteReason!!.contains("长度上限"))
+    }
+
+    @Test
+    fun `finish_reason content_filter - 标记内容过滤`() {
+        val agg = EngineClient.StreamAggregator()
+        agg.apply(chunk("""{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"部分"},"finish_reason":"content_filter"}]}"""))
+        val r = agg.result() as ToolCallResult.Content
+        assertTrue(r.incompleteReason!!.contains("内容过滤"))
+    }
+
+    @Test
+    fun `有分片无法解析 - 标记不完整并给出数量`() {
+        val agg = EngineClient.StreamAggregator()
+        agg.apply(chunk("""{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"前半"},"finish_reason":null}]}"""))
+        agg.markDropped()
+        agg.apply(chunk("""{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"后半"},"finish_reason":"stop"}]}"""))
+        val r = agg.result() as ToolCallResult.Content
+        assertEquals("前半后半", r.text)
+        assertTrue(r.incompleteReason!!.contains("1 段"))
+    }
+
+    @Test
+    fun `长度截断优先于分片丢失的提示`() {
+        val reason = EngineClient.incompleteReason(truncatedByLength = true, filtered = false, droppedChunks = 3)
+        assertTrue(reason!!.contains("长度上限"))
+        assertNull(EngineClient.incompleteReason(truncatedByLength = false, filtered = false, droppedChunks = 0))
+    }
+
+    private fun assertNull(v: Any?) = org.junit.Assert.assertNull(v)
+
     private fun assertFalse(b: Boolean) = org.junit.Assert.assertFalse(b)
 }
