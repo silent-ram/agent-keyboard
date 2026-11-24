@@ -140,7 +140,7 @@ val syncFcitxTestMipmaps by tasks.registering(Sync::class) {
 ksp {
     arg(
         "room.schemaLocation",
-        rootDir.parentFile.resolve("third_party/fcitx5-android/app/schemas").absolutePath,
+        "$projectDir/schemas",
     )
 }
 

@@ -124,6 +124,12 @@ internal class FcitxAgentPanelController(
 
     fun open() {
         if (service.isAgentPanelBlocked()) return
+        // 输入法服务 directBootAware:开机未解锁时也会运行,但 agent.db / DataStore / Keystore 密文都在
+        // 凭据加密存储中,此时读取会抛异常。未解锁一律不打开面板,解锁后再用。
+        if (isUserLocked()) {
+            android.widget.Toast.makeText(appContext, R.string.agent_panel_locked, android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
         visible = true
         state.imeInputMode = true
         inputBuffer.setText(state.input)
@@ -136,6 +142,9 @@ internal class FcitxAgentPanelController(
         visibilityListener?.invoke(true)
         refreshPanelConfig()
     }
+
+    private fun isUserLocked(): Boolean =
+        appContext.getSystemService(android.os.UserManager::class.java)?.isUserUnlocked == false
 
     fun close(clearDraft: Boolean = false) {
         historyOpenJob?.cancel()

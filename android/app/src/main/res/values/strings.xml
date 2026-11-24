@@ -264,4 +264,6 @@
     <string name="share_import_ok_fmt">已导入分享内容(%1$d chunks)</string>
     <string name="share_import_failed_fmt">分享导入失败:%1$s</string>
     <string name="share_import_empty">分享内容为空,未导入</string>
+    <!-- Direct Boot:开机未解锁时 Agent 数据在凭据加密存储中不可读 -->
+    <string name="agent_panel_locked">请先解锁设备再使用 AI 助手</string>
 </resources>

@@ -185,7 +185,7 @@ interface AgentMemoryDao {
         AgentMemoryEntity::class,
     ],
     version = 7,
-    exportSchema = false,
+    exportSchema = true,
 )
 abstract class AgentDatabase : RoomDatabase() {
     abstract fun sessionDao(): AgentSessionDao
