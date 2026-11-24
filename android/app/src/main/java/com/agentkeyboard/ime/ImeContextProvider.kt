@@ -20,13 +20,19 @@ object ImeContextProvider {
         if (info == null) return Mode.NORMAL
         if (info.inputType == InputType.TYPE_NULL) return Mode.NULL
 
+        // 变体值按输入类别解释:TYPE_NUMBER_VARIATION_PASSWORD 与 TYPE_TEXT_VARIATION_URI 都是 0x10,
+        // 不先看类别会把浏览器地址栏等 URI 输入框误判为密码框。
+        val inputClass = info.inputType and InputType.TYPE_MASK_CLASS
         val variation = info.inputType and InputType.TYPE_MASK_VARIATION
 
-        val isPassword =
-            variation == InputType.TYPE_TEXT_VARIATION_PASSWORD ||
-            variation == InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ||
-            variation == InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD ||
-            variation == InputType.TYPE_NUMBER_VARIATION_PASSWORD
+        val isPassword = when (inputClass) {
+            InputType.TYPE_CLASS_TEXT ->
+                variation == InputType.TYPE_TEXT_VARIATION_PASSWORD ||
+                    variation == InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ||
+                    variation == InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD
+            InputType.TYPE_CLASS_NUMBER -> variation == InputType.TYPE_NUMBER_VARIATION_PASSWORD
+            else -> false
+        }
 
         return if (isPassword) Mode.PASSWORD else Mode.NORMAL
     }

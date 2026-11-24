@@ -59,4 +59,27 @@ class ImeContextProviderTest {
             ImeContextProvider.detect(editorInfo(InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD)),
         )
     }
+
+    /** 回归:TYPE_TEXT_VARIATION_URI 与 TYPE_NUMBER_VARIATION_PASSWORD 同为 0x10,地址栏不得被当成密码框 */
+    @Test
+    fun uriField_isNormal() {
+        assertEquals(
+            Mode.NORMAL,
+            ImeContextProvider.detect(editorInfo(InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)),
+        )
+    }
+
+    @Test
+    fun plainNumberField_isNormal() {
+        assertEquals(
+            Mode.NORMAL,
+            ImeContextProvider.detect(editorInfo(InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL)),
+        )
+    }
+
+    /** 文本类的数字变体位值不应被当成数字密码,反之亦然 */
+    @Test
+    fun phoneField_isNormal() {
+        assertEquals(Mode.NORMAL, ImeContextProvider.detect(editorInfo(InputType.TYPE_CLASS_PHONE)))
+    }
 }
