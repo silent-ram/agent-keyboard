@@ -53,6 +53,14 @@ class AgentToolRegistry(
         val tool = get(call.toolId)
             ?: return ToolResult.error("未知工具:${call.toolId}", ToolErrorCodes.DISABLED)
 
+        // 参数不是 JSON 对象时直接回喂 BAD_PARAMS:模型可据此修正;出网工具也不必先弹授权再失败
+        if (!isJsonObjectOrBlank(call.argsJson)) {
+            return ToolResult.error(
+                "参数不是合法的 JSON 对象，请按工具 schema 重新生成参数",
+                ToolErrorCodes.BAD_PARAMS,
+            )
+        }
+
         // 免授权工具(IME 本职/本地):不弹窗、不逐条记日志
         if (!tool.isOutbound && tool.id !in LOGGED_LOCAL_TOOLS) {
             return executeTool(tool, call)
@@ -116,9 +124,16 @@ class AgentToolRegistry(
         } catch (e: kotlinx.coroutines.CancellationException) {
             // 取消必须传播(FR-B1"取消随时生效"):被 runCatching 吞掉会把取消误判为工具失败
             throw e
+        } catch (e: IllegalArgumentException) {
+            // 缺参/参数格式错(Jsons.requireString 等):把具体原因告诉模型,便于下一步修正参数
+            val detail = e.message?.take(MAX_PARAM_ERROR_CHARS)?.takeIf { it.isNotBlank() } ?: "参数不合法"
+            ToolResult.error("工具参数错误:$detail", ToolErrorCodes.BAD_PARAMS)
         } catch (e: Exception) {
             ToolResult.error("工具执行失败:${e.javaClass.simpleName}", ToolErrorCodes.INTERNAL)
         }
+
+    private fun isJsonObjectOrBlank(argsJson: String): Boolean =
+        argsJson.isBlank() || runCatching { org.json.JSONObject(argsJson) }.isSuccess
 
     private suspend fun classifyContains(paramsText: String, taint: TaintSnapshot): String =
         when (val d = com.agentkeyboard.agent.permission.ClassifyOutbound.classify(paramsText, taint)) {
@@ -132,6 +147,9 @@ class AgentToolRegistry(
     companion object {
         /** 本地但必须记日志的工具(每次上屏,11-权限设计 §5.2) */
         private val LOGGED_LOCAL_TOOLS = setOf(ToolIds.INSERT_TEXT)
+
+        /** 参数错误原因回喂模型的长度上限(防异常信息过长撑大上下文) */
+        private const val MAX_PARAM_ERROR_CHARS = 200
     }
 }
 

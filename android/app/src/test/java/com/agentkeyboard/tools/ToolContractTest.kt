@@ -104,6 +104,39 @@ class ToolContractTest {
     }
 
     @Test
+    fun `registry - 参数非JSON直接BAD_PARAMS且不弹授权`() = runBlocking {
+        var confirmations = 0
+        val gate = PermissionGate(FakePermissionStateDao(), FakeActivityLogDao(), ConfirmationResolver { confirmations++; true })
+        val registry = AgentToolRegistry(
+            tools = listOf(WebSearchTool(apiKeyProvider = { "k" }, transport = StubTransport(200, """{"results":[]}"""))),
+            gate = gate, activityLogDao = FakeActivityLogDao(),
+        )
+        val r = registry.execute(ToolCall("c1", "web_search", "not json"), TaintSnapshot(null, null), sessionId = null)
+        assertFalse(r.ok)
+        assertEquals(ToolErrorCodes.BAD_PARAMS, r.errorCode)
+        assertEquals(0, confirmations)
+    }
+
+    @Test
+    fun `registry - 工具缺参异常映射BAD_PARAMS并带原因`() = runBlocking {
+        val tool = object : Tool {
+            override val id = "local_echo"
+            override val name = "本地回显"
+            override val isOutbound = false
+            override val targetLabel = "本机"
+            override val description = "fake"
+            override val schemaJson = """{"type":"object"}"""
+            override suspend fun execute(argsJson: String): ToolResult =
+                ToolResult.ok(Jsons.requireString(argsJson, "query"), "")
+        }
+        val gate = PermissionGate(FakePermissionStateDao(), FakeActivityLogDao(), ConfirmationResolver { true })
+        val registry = AgentToolRegistry(listOf(tool), gate, FakeActivityLogDao())
+        val r = registry.execute(ToolCall("c1", "local_echo", "{}"), TaintSnapshot(null, null), null)
+        assertEquals(ToolErrorCodes.BAD_PARAMS, r.errorCode)
+        org.junit.Assert.assertTrue(r.raw.contains("缺少参数 query"))
+    }
+
+    @Test
     fun `registry - 未知工具映射DISABLED`() = runBlocking {
         val gate = PermissionGate(FakePermissionStateDao(), FakeActivityLogDao(), ConfirmationResolver { true })
         val registry = AgentToolRegistry(emptyList(), gate, FakeActivityLogDao())

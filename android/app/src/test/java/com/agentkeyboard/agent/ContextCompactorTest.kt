@@ -42,6 +42,52 @@ class ContextCompactorTest {
     }
 
     @Test
+    fun `旧轮工具结果折叠 - 摘要取正文且分隔符成对`() {
+        val wrapped = com.agentkeyboard.tools.ToolResultWrapper.wrap("正文开头" + "x".repeat(500))
+        val messages = listOf(
+            EngineMessage("system", "sys"),
+            EngineMessage("user", "第一轮"),
+            EngineMessage("tool", wrapped, toolCallId = "c1", toolName = "web_search"),
+            EngineMessage("user", "第二轮"),
+        )
+        val folded = ContextCompactor.foldOldToolResults(messages, currentTurnStart = 3)[2].content
+        val open = com.agentkeyboard.tools.ToolResultWrapper.OPEN
+        val close = com.agentkeyboard.tools.ToolResultWrapper.CLOSE
+        assertTrue(folded.startsWith("[工具结果已折叠] web_search:"))
+        assertEquals(1, folded.split(open).size - 1)
+        assertEquals(1, folded.split(close).size - 1)
+        assertTrue(folded.contains("正文开头"))
+        assertTrue(folded.length < wrapped.length)
+    }
+
+    @Test
+    fun `token估算 - 计入assistant工具调用参数`() {
+        val args = """{"query":"${"a".repeat(400)}"}"""
+        val withCalls = EngineMessage(
+            "assistant", "",
+            toolCalls = listOf(com.agentkeyboard.ai.EngineToolCall("c1", "web_search", args)),
+        )
+        assertTrue(ContextCompactor.totalTokens(listOf(withCalls)) >= 100)
+    }
+
+    @Test
+    fun `当前轮超预算 - 折叠较早步骤工具结果 最新一批保留全文`() {
+        val big = "检索结果".repeat(300)
+        val messages = listOf(
+            EngineMessage("system", "sys"),
+            EngineMessage("user", "当前问题"),
+            EngineMessage("assistant", "", toolCalls = listOf(com.agentkeyboard.ai.EngineToolCall("c1", "web_search", "{}"))),
+            EngineMessage("tool", big, toolCallId = "c1", toolName = "web_search"),
+            EngineMessage("assistant", "", toolCalls = listOf(com.agentkeyboard.ai.EngineToolCall("c2", "fetch_page", "{}"))),
+            EngineMessage("tool", big, toolCallId = "c2", toolName = "fetch_page"),
+        )
+        val out = ContextCompactor.compact(messages, budgetTokens = 1500, currentTurnStart = 1)
+        assertEquals(messages.size, out.size) // 配对不变,不丢消息
+        assertTrue(out.first { it.toolCallId == "c1" }.content.startsWith("[工具结果已折叠]"))
+        assertEquals(big, out.first { it.toolCallId == "c2" }.content)
+    }
+
+    @Test
     fun `超预算 - 自最旧整轮丢弃并附注记`() {
         val messages = mutableListOf(
             EngineMessage("system", "sys"),
