@@ -94,6 +94,7 @@ class AgentRuntimeTest {
             backoffMs: (Int) -> Long = { 0L },
             retryDelay: suspend (Long) -> Unit = {},
             protectedConfig: Collection<String> = emptyList(),
+            toolMaxSteps: Int = 6,
         ): AgentRuntime =
             AgentRuntime(
                 scope = scope,
@@ -106,6 +107,7 @@ class AgentRuntimeTest {
                 backoffMs = backoffMs,
                 retryDelay = retryDelay,
                 protectedConfigProvider = { protectedConfig },
+                toolMaxSteps = toolMaxSteps,
             )
     }
 
@@ -828,18 +830,19 @@ class AgentRuntimeTest {
     @Test
     fun `步骤预算耗尽 - 不追加模型收尾请求并以未完成结束`() { runBlocking {
         val h = Harness()
-        repeat(AgentRuntime.MAX_STEPS) {
+        repeat(3) {
             h.llmScript += ToolCallResult.ToolCalls(
                 "", listOf(EngineToolCall("c$it", "fetch_page", "{}")),
             )
         }
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
-        val engine = h.buildEngine(scope)
+        // 显式限制为 3 步:验证"预算耗尽不追加收尾请求"的语义,与默认上限值解耦
+        val engine = h.buildEngine(scope, toolMaxSteps = 3)
         val events = mutableListOf<AgentEvent>()
         val collectJob = scope.launch { engine.events.collect { events += it } }
         val job = engine.start(Task(TaskType.ASK, "问"))
         withTimeout(10000) { job.join() }
-        assertEquals(AgentRuntime.MAX_STEPS, h.receivedMessages.size)
+        assertEquals(3, h.receivedMessages.size)
         assertTrue(h.receivedMessages.all { messages ->
             messages.none { it.content.contains("maximum number of tool steps") }
         })
@@ -1323,6 +1326,131 @@ class AgentRuntimeTest {
         // 1 次 llm(第 1 步) + 1 次工具 + 1 次 llm(第 2 步) = 3 条 trace
         assertEquals(listOf("llm", "fetch_page", "llm"), finished.summary.steps.map { it.kind })
         collectJob.cancel(); scope.coroutineContext[Job]?.cancelChildren()
+    }
+    }
+
+    @Test
+    fun `步数上限 - 工具任务默认可超过旧的4步`() { runBlocking {
+        val h = Harness()
+        // 5 轮工具调用后给出回答:旧的 MAX_STEPS=4 会在第 4 步就判未完成
+        repeat(5) { i ->
+            h.llmScript += ToolCallResult.ToolCalls("", listOf(EngineToolCall("c$i", "fetch_page", "{}")))
+        }
+        h.llmScript += ToolCallResult.Content("完成")
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val engine = h.buildEngine(scope)
+        val job = engine.start(Task(TaskType.ASK, "问"))
+        withTimeout(5000) { job.join() }
+        assertEquals(6, h.receivedMessages.size)
+        assertEquals(SessionStatus.DONE, h.sessionDao.sessions[0].status)
+        scope.coroutineContext[Job]?.cancelChildren()
+    }
+    }
+
+    @Test
+    fun `步数上限 - 单轮快捷动作固定一步`() { runBlocking {
+        val h = Harness()
+        h.llmScript += ToolCallResult.Content("直出")
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val engine = h.buildEngine(scope)
+        val job = engine.start(Task(TaskType.REWRITE, "改写", singleTurn = true))
+        withTimeout(5000) { job.join() }
+        assertEquals(1, h.receivedMessages.size)
+        assertTrue("单轮不带工具", h.receivedToolIds.single().isEmpty())
+        scope.coroutineContext[Job]?.cancelChildren()
+    }
+    }
+
+    @Test
+    fun `并行工具 - 免授权工具并发执行且结果按调用顺序回填`() { runBlocking {
+        val h = Harness()
+        val concurrent = java.util.concurrent.atomic.AtomicInteger(0)
+        val maxConcurrent = java.util.concurrent.atomic.AtomicInteger(0)
+        val order = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val slowLocal = object : com.agentkeyboard.tools.Tool {
+            override val id = "local_a"
+            override val name = "本地A"
+            override val isOutbound = false
+            override val targetLabel = "本机"
+            override val description = "fake"
+            override val schemaJson = """{"type":"object"}"""
+            override suspend fun execute(argsJson: String): ToolResult {
+                val now = concurrent.incrementAndGet()
+                maxConcurrent.updateAndGet { m -> maxOf(m, now) }
+                kotlinx.coroutines.delay(80)
+                order += "local_a"
+                concurrent.decrementAndGet()
+                return ToolResult.ok("A", ToolResultWrapper.wrap("A"))
+            }
+        }
+        val slowLocalB = object : com.agentkeyboard.tools.Tool {
+            override val id = "local_b"
+            override val name = "本地B"
+            override val isOutbound = false
+            override val targetLabel = "本机"
+            override val description = "fake"
+            override val schemaJson = """{"type":"object"}"""
+            override suspend fun execute(argsJson: String): ToolResult {
+                val now = concurrent.incrementAndGet()
+                maxConcurrent.updateAndGet { m -> maxOf(m, now) }
+                kotlinx.coroutines.delay(80)
+                order += "local_b"
+                concurrent.decrementAndGet()
+                return ToolResult.ok("B", ToolResultWrapper.wrap("B"))
+            }
+        }
+        val registry = AgentToolRegistry(listOf(slowLocal, slowLocalB), h.gate, h.logs)
+        h.llmScript += ToolCallResult.ToolCalls(
+            "",
+            listOf(EngineToolCall("a1", "local_a", "{}"), EngineToolCall("b1", "local_b", "{}")),
+        )
+        h.llmScript += ToolCallResult.Content("完成")
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val engine = h.buildEngine(scope, registry)
+        val job = engine.start(Task(TaskType.ASK, "问"))
+        withTimeout(5000) { job.join() }
+        assertEquals("两个免授权工具应真正并发", 2, maxConcurrent.get())
+        // 回填顺序仍是模型给出的调用顺序,不受完成先后影响
+        val toolMsgs = h.receivedMessages.last().filter { it.role == MessageRoles.TOOL }
+        assertEquals(listOf("a1", "b1"), toolMsgs.map { it.toolCallId })
+        scope.coroutineContext[Job]?.cancelChildren()
+    }
+    }
+
+    @Test
+    fun `并行工具 - 含出网工具时整批串行,不并发授权`() { runBlocking {
+        val h = Harness()
+        val concurrent = java.util.concurrent.atomic.AtomicInteger(0)
+        val maxConcurrent = java.util.concurrent.atomic.AtomicInteger(0)
+        fun probe(id: String, outbound: Boolean) = object : com.agentkeyboard.tools.Tool {
+            override val id = id
+            override val name = id
+            override val isOutbound = outbound
+            override val targetLabel = "本机"
+            override val description = "fake"
+            override val schemaJson = """{"type":"object"}"""
+            override suspend fun execute(argsJson: String): ToolResult {
+                val now = concurrent.incrementAndGet()
+                maxConcurrent.updateAndGet { m -> maxOf(m, now) }
+                kotlinx.coroutines.delay(50)
+                concurrent.decrementAndGet()
+                return ToolResult.ok("ok", ToolResultWrapper.wrap("ok"))
+            }
+        }
+        val registry = AgentToolRegistry(
+            listOf(probe("local_a", false), probe("web_like", true)), h.gate, h.logs,
+        )
+        h.llmScript += ToolCallResult.ToolCalls(
+            "",
+            listOf(EngineToolCall("a1", "local_a", "{}"), EngineToolCall("w1", "web_like", "{}")),
+        )
+        h.llmScript += ToolCallResult.Content("完成")
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val engine = h.buildEngine(scope, registry)
+        val job = engine.start(Task(TaskType.ASK, "问"))
+        withTimeout(5000) { job.join() }
+        assertEquals("含授权工具时必须串行", 1, maxConcurrent.get())
+        scope.coroutineContext[Job]?.cancelChildren()
     }
     }
 

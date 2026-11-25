@@ -26,7 +26,9 @@ import com.agentkeyboard.tools.TOOL_USER_DENIED
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -65,7 +67,9 @@ class AgentRuntime(
         EngineClient.streamWithTools(baseUrl, apiKey, model, messages, tools, handle, onDelta)
     },
     private val clock: () -> Long = System::currentTimeMillis,
+    /** 单轮快捷动作用 1 步;工具任务用 [toolMaxSteps](默认 [DEFAULT_TOOL_STEPS]) */
     internal val maxSteps: Int = MAX_STEPS,
+    private val toolMaxSteps: Int = DEFAULT_TOOL_STEPS,
     /** 可注入共享事件流(工厂场景:PermissionGate 的确认条事件与 engine 事件同流) */
     eventsFlow: MutableSharedFlow<AgentEvent>? = null,
     /** 超时重试退避序列(ms):attempt 0/1/2 → 1s/2s/4s(指数);单测可注入常数 0 */
@@ -83,7 +87,18 @@ class AgentRuntime(
 ) : AgentEngine {
 
     companion object {
+        /** 默认步数上限;工具任务按此值运行,可在构造时覆盖。 */
         const val MAX_STEPS = 4
+
+        /**
+         * 带工具任务的实际步数上限(硬上限 [MAX_STEPS_HARD_CAP])。
+         * 4 步只够"检索一次 + 回答",多轮检索/多工具场景会以未完成结束;
+         * 单轮快捷动作(singleTurn)仍只走 1 步,不受影响。
+         */
+        const val DEFAULT_TOOL_STEPS = 6
+        /** 防止模型无进展地反复调工具导致费用失控 */
+        const val MAX_STEPS_HARD_CAP = 10
+
 
         /**
          * 超时重试次数上限(M3 欠账清零:由 2 提到 3,配合指数退避)。
@@ -252,7 +267,10 @@ class AgentRuntime(
             // M3 快捷动作:task.singleTurn = true 同样整轮不带 tools(单轮模板路径,一次直出)。
             val contextWindow = cfg.contextWindow.takeIf { it > 0 } ?: task.contextWindowTokens
             val fcDisabled = cfg.toolsAllowed == false || task.singleTurn
-            val canPropose = task.allowProfileSuggestion && task.type == TaskType.KNOWLEDGE_ASK && !fcDisabled && maxSteps > 1
+            // 单轮模板路径固定 1 步;工具任务用可配置上限(受硬顶约束)
+            val stepLimit = if (task.singleTurn || fcDisabled) 1
+                else toolMaxSteps.coerceIn(1, MAX_STEPS_HARD_CAP)
+            val canPropose = task.allowProfileSuggestion && task.type == TaskType.KNOWLEDGE_ASK && !fcDisabled && stepLimit > 1
             val tools = if (fcDisabled) emptyList() else registry.schemas().filter { schema ->
                 schema.id in request.allowedToolIds &&
                     (!schema.id.startsWith(com.agentkeyboard.mcp.McpTool.ID_PREFIX) ||
@@ -271,14 +289,15 @@ class AgentRuntime(
             var step = 0
             val traceSteps = mutableListOf<AgentTraceStep>()
             var runUsage = com.agentkeyboard.ai.TokenUsage.ZERO
-            while (step < maxSteps) {
+            while (step < stepLimit) {
                 step++
                 _events.emit(AgentEvent.Thinking(step))
                 val folded = ContextCompactor.compact(
                     fullMessages, ContextCompactor.foldBudget(contextWindow), currentTurnStartFull
                 )
                 val llmStartedAt = clock()
-                val result = callWithRetry(                    cfg, folded, sessionId = sessionId,
+                val result = callWithRetry(
+                    cfg, folded, sessionId = sessionId,
                     tools = if (canPropose && step == 1) tools + ProfileSuggestion.schema else tools,
                     stream = stream,
                     includesProfile = profile.userMd.isNotBlank() || profile.memories.any(String::isNotBlank),
@@ -329,6 +348,30 @@ class AgentRuntime(
                             EngineClient.ROLE_ASSISTANT, intermediate, toolCalls = calls
                         )
                         unresolvedCalls.addAll(calls)
+                        // 并行执行"免授权且互相独立"的工具,其余保持串行。
+                        // 只有免授权工具能并发:授权确认条是单槽(pendingConfirmation),
+                        // 并发两个需授权的调用会互相覆盖,用户无法确认。
+                        val parallelizable = calls.size > 1 &&
+                            calls.all { c ->
+                                c.name in exposedToolIds &&
+                                    registry.get(c.name)?.isOutbound == false &&
+                                    registry.get(c.name)?.id != ToolIds.INSERT_TEXT
+                            }
+                        val preExecuted: Map<String, Pair<ToolResult, Long>> = if (parallelizable) {
+                            val startedAt = clock()
+                            kotlinx.coroutines.coroutineScope {
+                                calls.map { c ->
+                                    async {
+                                        c.id to (registry.execute(
+                                            ToolCall(c.id, c.name, c.argumentsJson), taint, sessionId,
+                                        ) to startedAt)
+                                    }
+                                }.awaitAll().toMap()
+                            }
+                        } else {
+                            emptyMap()
+                        }
+
                         for ((callIndex, call) in calls.withIndex()) {
                             if (!currentCoroutineContext().isActive) throw CancellationException("engine stopped")
                             val tc = ToolCall(toolCallId = call.id, toolId = call.name, argsJson = call.argumentsJson)
@@ -336,10 +379,12 @@ class AgentRuntime(
                             val permitted = call.name in exposedToolIds && registry.get(call.name) != null
                             if (permitted && call.name == ToolIds.KB_SEARCH) knowledgeSearchUsed = true
                             val toolStartedAt = clock()
-                            val received = if (permitted) {
-                                registry.execute(tc, taint, sessionId)
-                            } else {
-                                ToolResult.error(
+                            // 并行分支已执行完:取缓存结果;串行分支现场执行
+                            val cached = preExecuted[call.id]
+                            val received = when {
+                                cached != null -> cached.first
+                                permitted -> registry.execute(tc, taint, sessionId)
+                                else -> ToolResult.error(
                                     "此工具未注册或不在本轮允许范围内，任务已停止",
                                     ToolErrorCodes.DISABLED,
                                 )
@@ -364,7 +409,8 @@ class AgentRuntime(
                             if (!toolResult.ok) hadToolFailure = true
                             persistToolResult(sessionId, call, toolResult, flagged, step)
                             traceSteps += AgentTraceStep(
-                                step = step, kind = call.name, elapsedMs = clock() - toolStartedAt,
+                                step = step, kind = call.name,
+                                elapsedMs = clock() - (cached?.second ?: toolStartedAt),
                                 ok = toolResult.ok, errorCode = toolResult.errorCode,
                             )
                             unresolvedCalls.remove(call)
@@ -396,7 +442,7 @@ class AgentRuntime(
                 }
             }
             if (incompleteReason == null && finalText == null) {
-                incompleteReason = "已达到本轮 $maxSteps 步上限，任务未完成"
+                incompleteReason = "已达到本轮 $stepLimit 步上限，任务未完成"
             }
             if (
                 incompleteReason == null &&
