@@ -45,7 +45,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 typealias LlmCallFn = suspend (
     baseUrl: String, apiKey: String, model: String,
     messages: List<EngineMessage>, tools: List<com.agentkeyboard.tools.ToolSchema>,
-    handle: com.agentkeyboard.ai.StreamingHandle, onDelta: (String) -> Unit,
+    handle: com.agentkeyboard.ai.StreamingHandle, onDelta: suspend (String) -> Unit,
 ) -> ToolCallResult
 
 private class LlmCallDeniedException : Exception()
@@ -284,15 +284,21 @@ class AgentRuntime(
                 when (result) {
                     is ToolCallResult.Content -> {
                         if (safety.unsafeRenderedAnswer(result.text)) {
+                            // 草稿已在屏上,拦截后必须撤回,不能留下未通过检查的文字
+                            _events.emit(AgentEvent.ContentReset)
                             throw UnsafeAgentOutput()
                         }
                         finalText = safety.displayAnswer(result.text)
+                        // 翻译/脱敏后可能与草稿不同(如命中的配置值被遮盖),以审核后的文本为准重新展示
+                        if (finalText != result.text) _events.emit(AgentEvent.ContentDelta(finalText))
                         persistAssistant(sessionId, step, finalText, null, citations)
                         // 长度上限/内容过滤/分片丢失:保留已生成内容,但不能声称任务完整完成
                         result.incompleteReason?.let { incompleteReason = it }
                         break
                     }
                     is ToolCallResult.ToolCalls -> {
+                        // 本轮转为工具调用:模型可能先流出了"我来查一下"之类的草稿,随后并不作为回答保留
+                        _events.emit(AgentEvent.ContentReset)
                         // 模型重复返回同一 toolCallId 视为一次调用:双份 tool 回复会破坏
                         // 历史配对(续问时同 id 两条 tool 消息会被 API 拒绝)。
                         val returned = result.calls.distinctBy { it.id }
@@ -545,14 +551,21 @@ class AgentRuntime(
         while (true) {
             if (!gate.ensureLlmDisclosed(sessionId, includesProfile, cfg.baseUrl)) throw LlmCallDeniedException()
             try {
-                // SSE is still cancellable. Keep partial tokens private until the complete result is checked.
-                return llmCall(cfg.baseUrl, cfg.apiKey, model, messages, tools, stream) {}
+                // 流式放开:草稿先上屏供阅读,但草稿卡不可插入;完整回答须再通过内容检查才转为可交付结果。
+                // 检查不通过 / 即将转入工具调用时发 ContentReset 撤回草稿。
+                return llmCall(cfg.baseUrl, cfg.apiKey, model, messages, tools, stream) { accumulated ->
+                    // 挂起式 emit(非 tryEmit):onDelta 在 IO 线程且首帧常早于面板收集器就绪,
+                    // tryEmit 在无订阅者时会丢弃 first 增量,导致逐字效果从第二段才开始
+                    // 已被新任务取代(本任务流被 cancel):残留回调不得冒到新任务的界面上
+                    if (stream.cancelRequested) return@llmCall
+                    _events.emit(AgentEvent.ContentDelta(accumulated))
+                }
             } catch (e: CancellationException) {
+                _events.tryEmit(AgentEvent.ContentReset)
                 throw e
             } catch (e: Exception) {
-                // 超时重试(M3:最多 3 次,指数退避 1s/2s/4s 再重发,降低限流/网络抖动
-                // 场景下的连续失败率);其余错误直接上抛 → Failed
-                // 超时、限流(429)与服务端临时故障(5xx)同走退避;SDK 内置重试已关闭,此处是唯一重试层
+                // 重试会从头重发,已显示的半截文字必须撤回,否则会与重试结果拼接成错误内容
+                _events.tryEmit(AgentEvent.ContentReset)
                 if (ErrorClassifier.isRetryable(e) && attempt < MAX_TIMEOUT_RETRIES) {
                     retryDelay(backoffMs(attempt))
                     attempt++

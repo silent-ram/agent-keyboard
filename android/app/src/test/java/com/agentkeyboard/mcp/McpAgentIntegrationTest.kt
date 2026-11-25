@@ -65,7 +65,7 @@ class McpAgentIntegrationTest {
         val llmToolsSeen = mutableListOf<List<com.agentkeyboard.tools.ToolSchema>>()
         val llmScript = mutableListOf<ToolCallResult>()
         val receivedMessages = mutableListOf<List<com.agentkeyboard.ai.EngineMessage>>()
-        val llmCall: suspend (String, String, String, List<com.agentkeyboard.ai.EngineMessage>, List<com.agentkeyboard.tools.ToolSchema>, com.agentkeyboard.ai.StreamingHandle, (String) -> Unit) -> ToolCallResult =
+        val llmCall: suspend (String, String, String, List<com.agentkeyboard.ai.EngineMessage>, List<com.agentkeyboard.tools.ToolSchema>, com.agentkeyboard.ai.StreamingHandle, suspend (String) -> Unit) -> ToolCallResult =
             { _, _, _, messages, tools, _, _ ->
                 receivedMessages += messages
                 llmToolsSeen += tools

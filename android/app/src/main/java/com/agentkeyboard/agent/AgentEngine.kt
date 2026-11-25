@@ -100,6 +100,13 @@ sealed class AgentEvent {
     /** 流式增量(M1-T6):[accumulated] 为当前累积的 assistant 文本(面板逐字 / FR-D2 上屏) */
     data class ContentDelta(val accumulated: String) : AgentEvent()
 
+    /**
+     * 撤回已流式展示的草稿(流式放开后的安全兜底):
+     * 完整回答未通过内容检查、或即将转入工具调用时发出,面板丢弃对应草稿卡,
+     * 草稿卡本身不可插入 [PanelMessage.Result.canInsert],不会误上屏。
+     */
+    data object ContentReset : AgentEvent()
+
     data class StepStarted(val call: ToolCall, val step: Int) : AgentEvent()
 
     /** [flagged] = 工具结果命中注入扫描警示(FR-E4) */

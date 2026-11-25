@@ -323,6 +323,15 @@ internal class FcitxAgentPanelController(
 
     private fun onAgentEvent(event: AgentEvent) {
         when (event) {
+            is AgentEvent.ContentDelta -> {
+                // 草稿上屏:只影响面板展示,不进入状态判定,完成/未完成事件仍以审核后的文本为准
+                replaceMessages(PanelReducer.apply(state.messages.toList(), event, state.modelLabel, null))
+            }
+            is AgentEvent.ContentReset -> {
+                replaceMessages(PanelReducer.apply(state.messages.toList(), event, state.modelLabel, null))
+                // 重试会重新计时:撤回草稿同时重置起点,避免把失败尝试的耗时计入最终结果
+                elapsedStartedAt.set(android.os.SystemClock.elapsedRealtime())
+            }
             is AgentEvent.Started -> {
                 submittedQuestion?.let { state.messages.add(PanelMessage.UserText(it)) }
                 submittedQuestion = null

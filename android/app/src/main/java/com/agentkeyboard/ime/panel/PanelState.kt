@@ -252,6 +252,13 @@ object PanelReducer {
         }
     }
 
+    /**
+     * 撤回流式草稿(安全兜底):去掉所有草稿卡。草稿从不进入编辑器,
+     * 撤回后由随后的 Finished/Incomplete 提供唯一可信结果。
+     */
+    fun onContentReset(messages: List<PanelMessage>): List<PanelMessage> =
+        messages.filterNot { it is PanelMessage.Result && it.streaming }
+
     /** 失败 → 错误卡(Loading 移除) */
     fun onFailed(messages: List<PanelMessage>, kind: String, message: String): List<PanelMessage> =
         messages.filterNot { it == PanelMessage.Loading } + PanelMessage.Error(kind, message)
@@ -339,6 +346,7 @@ object PanelReducer {
                 citationCount = event.result.citations.size, flagged = event.flagged,
             )
             is AgentEvent.ContentDelta -> onContentDelta(messages, event.accumulated, modelLabel)
+            is AgentEvent.ContentReset -> onContentReset(messages)
             is AgentEvent.Finished -> onFinished(messages, event.content, event.citations, modelLabel, elapsedSeconds)
             is AgentEvent.Incomplete -> onIncomplete(
                 messages, event.content, event.citations, modelLabel, elapsedSeconds, event.reason,

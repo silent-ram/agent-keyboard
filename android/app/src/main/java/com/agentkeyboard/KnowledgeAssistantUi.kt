@@ -243,6 +243,11 @@ fun KnowledgeAssistantRoot(
                     busy = false
                     status = null
                 }
+                is AgentEvent.ContentReset -> {
+                    // 草稿撤回(检查未通过 / 转入工具调用 / 重试):丢弃未审核的流式半截文字
+                    val last = messages.lastOrNull()
+                    if (last?.role == MessageRoles.ASSISTANT && last.streaming) messages.removeAt(messages.lastIndex)
+                }
                 is AgentEvent.ConfirmationRequired -> Unit
             }
         }

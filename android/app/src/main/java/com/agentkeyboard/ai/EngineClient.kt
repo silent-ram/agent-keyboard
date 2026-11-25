@@ -156,7 +156,7 @@ object EngineClient {
         messages: List<EngineMessage>,
         tools: List<ToolSchema>,
         handle: StreamingHandle,
-        onDelta: (String) -> Unit,
+        onDelta: suspend (String) -> Unit,
     ): ToolCallResult = withContext(Dispatchers.IO) {
         val client = clientFor(baseUrl, apiKey)
         // M1 批次 3:每次调用开始清残留取消标志(单例 handle 跨任务复用,标志不清会让新任务启动即被杀)
