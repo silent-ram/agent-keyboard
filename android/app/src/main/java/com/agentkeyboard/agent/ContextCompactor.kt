@@ -20,6 +20,10 @@ object ContextCompactor {
     const val CURRENT_TURN_TOOL_SUMMARY_LIMIT = 400
     const val FOLD_BUDGET_RATIO = 2 // 除数:contextWindow / 2 = 50%
     const val FOLDED_PREFIX = "[工具结果已折叠]"
+    const val OMITTED_MARK = "…(中间内容已省略)"
+
+    /** 句末/段落边界字符:压缩优先在这些位置断开,避免把一句话切成两半 */
+    private val SENTENCE_BREAKS = charArrayOf('。', '！', '？', '；', '!', '?', ';', '.', '\n')
 
     /** 中文 1 字 1 token;其余按 4 字符 1 token */
     fun estimateTokens(text: String): Int {
@@ -65,7 +69,8 @@ object ContextCompactor {
                 m.role == "user" && !firstUserSeen -> {
                     firstUserSeen = true
                     if (m.content.length > FIRST_USER_SUMMARY_LIMIT) {
-                        m.copy(content = m.content.take(FIRST_USER_SUMMARY_LIMIT) + "…(已精简)")
+                        // 首条提问只取开头(任务意图在前),但仍在句子边界切断
+                        m.copy(content = clipAtBoundary(m.content, FIRST_USER_SUMMARY_LIMIT) + "…(已精简)")
                     } else m
                 }
                 else -> m
@@ -82,7 +87,11 @@ object ContextCompactor {
             messages[it].role == "assistant" && !messages[it].toolCalls.isNullOrEmpty()
         } ?: return messages
         return messages.mapIndexed { i, m ->
-            if (i in currentTurnStart until lastBatch && m.role == "tool") foldTool(m, CURRENT_TURN_TOOL_SUMMARY_LIMIT) else m
+            if (i in currentTurnStart until lastBatch && m.role == "tool") {
+                foldTool(m, CURRENT_TURN_TOOL_SUMMARY_LIMIT)
+            } else {
+                m
+            }
         }
     }
 
@@ -90,9 +99,50 @@ object ContextCompactor {
     private fun foldTool(m: EngineMessage, limit: Int): EngineMessage {
         if (m.content.startsWith(FOLDED_PREFIX)) return m
         val inner = unwrap(m.content).trim()
-        val summary = if (inner.length > limit) inner.take(limit) + "…" else inner
+        val summary = semanticClip(inner, limit)
         val label = m.toolName ?: m.toolCallId.orEmpty()
         return m.copy(content = "$FOLDED_PREFIX $label:" + ToolResultWrapper.wrap(summary))
+    }
+
+    /**
+     * 语义化压缩:取开头一段 + 结尾一段,中间标注省略。
+     * 工具结果的关键结论常在末尾(结论、错误码、要点),只留开头会丢掉最有用的部分。
+     */
+    internal fun semanticClip(text: String, limit: Int): String {
+        if (text.length <= limit) return text
+        val headLimit = (limit * 2) / 3
+        val tailLimit = limit - headLimit
+        val head = clipAtBoundary(text, headLimit)
+        val tail = clipAtBoundaryFromEnd(text, tailLimit)
+        return head + "\n" + OMITTED_MARK + "\n" + tail
+    }
+
+    /** 从 0 开始按边界截断:优先段落,其次句末标点 */
+    internal fun clipAtBoundary(text: String, limit: Int): String {
+        if (limit <= 0) return ""
+        if (text.length <= limit) return text
+        val window = text.take(limit)
+        val cut = maxOf(window.lastIndexOf("\n\n"), window.lastIndexOfAny(SENTENCE_BREAKS))
+        // 边界太靠前(不足一半)时硬截断,避免只留下一句残句
+        return if (cut > limit / 2) window.take(cut + 1).trimEnd() else window.trimEnd()
+    }
+
+    /** 从末尾按边界截断,保留结尾结论 */
+    internal fun clipAtBoundaryFromEnd(text: String, limit: Int): String {
+        if (limit <= 0) return ""
+        if (text.length <= limit) return text
+        val window = text.substring(text.length - limit)
+        val paragraph = window.indexOf("\n\n").takeIf { it >= 0 }
+        val sentence = SENTENCE_BREAKS
+            .map { c -> window.indexOf(c) }
+            .filter { it >= 0 }
+            .minOrNull()
+        val cut = minOf(paragraph ?: Int.MAX_VALUE, sentence ?: Int.MAX_VALUE)
+        return if (cut != Int.MAX_VALUE && cut < limit / 2) {
+            window.substring(cut + 1).trimStart()
+        } else {
+            window.trimStart()
+        }
     }
 
     private fun unwrap(content: String): String {

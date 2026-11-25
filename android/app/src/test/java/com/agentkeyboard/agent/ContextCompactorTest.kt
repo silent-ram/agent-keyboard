@@ -42,6 +42,31 @@ class ContextCompactorTest {
     }
 
     @Test
+    fun `语义压缩 - 保留开头与结尾,中间标注省略`() {
+        val head = "开头要点。"
+        val mid = "中间无关内容。".repeat(50)
+        val tail = "末尾结论:订单已创建。"
+        val clipped = ContextCompactor.semanticClip(head + mid + tail, 120)
+        assertTrue(clipped.length < head.length + mid.length + tail.length)
+        assertTrue("应保留开头", clipped.startsWith("开头要点"))
+        assertTrue("应保留结尾结论", clipped.endsWith("订单已创建。") || clipped.contains("订单已创建"))
+        assertTrue(clipped.contains(ContextCompactor.OMITTED_MARK))
+    }
+
+    @Test
+    fun `语义压缩 - 不把句子切成两半`() {
+        val text = "第一句话内容。" + "第二句话内容。"
+        // 边界落在句号附近时应整句保留
+        val clipped = ContextCompactor.clipAtBoundary(text, 8)
+        assertTrue(clipped.endsWith("。"))
+    }
+
+    @Test
+    fun `语义压缩 - 未超限时原样返回`() {
+        assertEquals("短文本", ContextCompactor.semanticClip("短文本", 100))
+    }
+
+    @Test
     fun `旧轮工具结果折叠 - 摘要取正文且分隔符成对`() {
         val wrapped = com.agentkeyboard.tools.ToolResultWrapper.wrap("正文开头" + "x".repeat(500))
         val messages = listOf(
