@@ -205,6 +205,31 @@ class PanelStateTest {
     }
 
     @Test
+    fun `Finished - 服务端返回 usage 时展示真实 token 与工具调用次数`() {
+        val summary = com.agentkeyboard.agent.AgentRunSummary(
+            steps = listOf(
+                com.agentkeyboard.agent.AgentTraceStep(1, "llm", 120, com.agentkeyboard.ai.TokenUsage(10, 5, 15)),
+                com.agentkeyboard.agent.AgentTraceStep(1, "web_search", 80, ok = true),
+            ),
+            usage = com.agentkeyboard.ai.TokenUsage(10, 5, 15),
+        )
+        val out = PanelReducer.onFinished(
+            emptyList(), "回答", emptyList(), "AI", null, summary = summary,
+        )
+        val meta = out.filterIsInstance<PanelMessage.Result>().single().metaLine!!
+        assertTrue(meta.contains("10 + 5 tokens"))
+        assertTrue("真实用量不应带估算标记", !meta.contains("≈"))
+        assertTrue(meta.contains("1 次工具调用"))
+    }
+
+    @Test
+    fun `Finished - 无 usage 时退回本地估算并标近似`() {
+        val out = PanelReducer.onFinished(emptyList(), "回答", emptyList(), "AI", null)
+        val meta = out.filterIsInstance<PanelMessage.Result>().single().metaLine!!
+        assertTrue(meta.contains("≈"))
+    }
+
+    @Test
     fun `Incomplete - 部分结果标记未验证并保留原因`() {
         val citation = Citation("https://example.com", "来源")
         var msgs = PanelReducer.onThinking(emptyList())

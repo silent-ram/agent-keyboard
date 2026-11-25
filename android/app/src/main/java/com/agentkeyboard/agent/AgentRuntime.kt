@@ -269,20 +269,25 @@ class AgentRuntime(
             var knowledgeSearchUsed = false
             var knowledgeCitationCount = 0
             var step = 0
+            val traceSteps = mutableListOf<AgentTraceStep>()
+            var runUsage = com.agentkeyboard.ai.TokenUsage.ZERO
             while (step < maxSteps) {
                 step++
                 _events.emit(AgentEvent.Thinking(step))
                 val folded = ContextCompactor.compact(
                     fullMessages, ContextCompactor.foldBudget(contextWindow), currentTurnStartFull
                 )
-                val result = callWithRetry(
-                    cfg, folded, sessionId = sessionId,
+                val llmStartedAt = clock()
+                val result = callWithRetry(                    cfg, folded, sessionId = sessionId,
                     tools = if (canPropose && step == 1) tools + ProfileSuggestion.schema else tools,
                     stream = stream,
                     includesProfile = profile.userMd.isNotBlank() || profile.memories.any(String::isNotBlank),
                 )
-                when (result) {
-                    is ToolCallResult.Content -> {
+                runUsage += result.usage
+                traceSteps += AgentTraceStep(
+                    step = step, kind = "llm", elapsedMs = clock() - llmStartedAt, usage = result.usage,
+                )
+                when (result) {                    is ToolCallResult.Content -> {
                         if (safety.unsafeRenderedAnswer(result.text)) {
                             // 草稿已在屏上,拦截后必须撤回,不能留下未通过检查的文字
                             _events.emit(AgentEvent.ContentReset)
@@ -330,6 +335,7 @@ class AgentRuntime(
                             _events.emit(AgentEvent.StepStarted(tc, step))
                             val permitted = call.name in exposedToolIds && registry.get(call.name) != null
                             if (permitted && call.name == ToolIds.KB_SEARCH) knowledgeSearchUsed = true
+                            val toolStartedAt = clock()
                             val received = if (permitted) {
                                 registry.execute(tc, taint, sessionId)
                             } else {
@@ -357,6 +363,10 @@ class AgentRuntime(
                             }
                             if (!toolResult.ok) hadToolFailure = true
                             persistToolResult(sessionId, call, toolResult, flagged, step)
+                            traceSteps += AgentTraceStep(
+                                step = step, kind = call.name, elapsedMs = clock() - toolStartedAt,
+                                ok = toolResult.ok, errorCode = toolResult.errorCode,
+                            )
                             unresolvedCalls.remove(call)
                             fullMessages += EngineMessage(
                                 EngineClient.ROLE_TOOL,
@@ -409,11 +419,17 @@ class AgentRuntime(
                         citations = uniqueCitations,
                         reason = incompleteReason,
                         sessionId = sessionId,
+                        summary = AgentRunSummary(traceSteps.toList(), runUsage),
                     ),
                 )
             } else {
                 sessionDao.updateStatus(sessionId, SessionStatus.DONE)
-                _events.emit(AgentEvent.Finished(finalText.orEmpty(), uniqueCitations, sessionId, suggestion))
+                _events.emit(
+                    AgentEvent.Finished(
+                        finalText.orEmpty(), uniqueCitations, sessionId, suggestion,
+                        summary = AgentRunSummary(traceSteps.toList(), runUsage),
+                    ),
+                )
             }
         } catch (_: LlmCallDeniedException) {
             withContext(NonCancellable) {

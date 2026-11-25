@@ -349,6 +349,7 @@ internal class FcitxAgentPanelController(
                         elapsed,
                         editorGeneration = requestGeneration,
                         editorSelection = requestSelection,
+                        summary = event.summary,
                     ),
                 )
                 activeSessionId = event.sessionId
@@ -363,6 +364,7 @@ internal class FcitxAgentPanelController(
                         state.messages.toList(), event.content, event.citations, state.modelLabel, null, event.reason,
                         editorGeneration = requestGeneration,
                         editorSelection = requestSelection,
+                        summary = event.summary,
                     ),
                 )
                 activeSessionId = event.sessionId

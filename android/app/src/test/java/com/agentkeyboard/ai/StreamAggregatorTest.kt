@@ -112,6 +112,26 @@ class StreamAggregatorTest {
         assertNull(EngineClient.incompleteReason(truncatedByLength = false, filtered = false, droppedChunks = 0))
     }
 
+    @Test
+    fun `usage - 尾帧 usage 被记录并出现在结果中`() {
+        val agg = EngineClient.StreamAggregator()
+        agg.apply(chunk("""{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"答"},"finish_reason":null}]}"""))
+        agg.apply(chunk("""{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}"""))
+        val r = agg.result()
+        assertEquals(11, r.usage.promptTokens)
+        assertEquals(7, r.usage.completionTokens)
+        assertEquals(18, r.usage.totalTokens)
+    }
+
+    @Test
+    fun `usage - 服务端未返回时保持为 0 且 isEmpty`() {
+        val agg = EngineClient.StreamAggregator()
+        agg.apply(chunk("""{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"答"},"finish_reason":"stop"}]}"""))
+        val r = agg.result()
+        assertEquals(0, r.usage.totalTokens)
+        assertTrue(r.usage.isEmpty)
+    }
+
     private fun assertNull(v: Any?) = org.junit.Assert.assertNull(v)
 
     private fun assertFalse(b: Boolean) = org.junit.Assert.assertFalse(b)

@@ -1,6 +1,7 @@
 package com.agentkeyboard.ime.panel
 
 import com.agentkeyboard.agent.AgentEvent
+import com.agentkeyboard.agent.AgentRunSummary
 import com.agentkeyboard.agent.ConfirmationKind
 import com.agentkeyboard.agent.ConfirmationRequest
 import com.agentkeyboard.data.db.AgentMessageEntity
@@ -179,6 +180,7 @@ object PanelReducer {
         fromSelection: Boolean = false,
         editorGeneration: Long? = null,
         editorSelection: EditorSelectionSnapshot? = null,
+        summary: AgentRunSummary = AgentRunSummary.EMPTY,
     ): List<PanelMessage> {
         // 流式卡(P1-3 同型):Finished 用正式卡替换,避免重复
         val base = messages.filterNot { it == PanelMessage.Loading }
@@ -186,10 +188,21 @@ object PanelReducer {
         val hadOutbound = hasOutboundCalls(base)
         val meta = buildString {
             append("AI")
-            append(" · ≈")
-            append(estimateTokens(content))
-            append(" tokens")
+            // 优先展示服务端真实用量;服务端未返回时退回本地估算并保留 ≈ 标记
+            if (summary.usage.isEmpty) {
+                append(" · ≈")
+                append(estimateTokens(content))
+                append(" tokens")
+            } else {
+                append(" · ")
+                append(summary.usage.promptTokens)
+                append(" + ")
+                append(summary.usage.completionTokens)
+                append(" tokens")
+            }
             elapsedSeconds?.let { append(" · ${it}s") }
+            val toolSteps = summary.steps.count { it.kind != "llm" }
+            if (toolSteps > 0) append(" · ${toolSteps} 次工具调用")
         }
         return base + PanelMessage.Result(
             text = content,
@@ -215,6 +228,7 @@ object PanelReducer {
         reason: String,
         editorGeneration: Long? = null,
         editorSelection: EditorSelectionSnapshot? = null,
+        summary: AgentRunSummary = AgentRunSummary.EMPTY,
     ): List<PanelMessage> {
         val visibleContent = content.ifBlank {
             if (citations.isNotEmpty()) "已获得部分资料，任务未完成。" else ""
@@ -227,6 +241,7 @@ object PanelReducer {
                 messages, visibleContent, citations, modelLabel, elapsedSeconds,
                 editorGeneration = editorGeneration.takeIf { hasAnswer },
                 editorSelection = editorSelection.takeIf { hasAnswer },
+                summary = summary,
             )
             val resultIndex = completed.indexOfLast { it is PanelMessage.Result }
             if (resultIndex < 0) completed else completed.mapIndexed { index, message ->
@@ -347,9 +362,12 @@ object PanelReducer {
             )
             is AgentEvent.ContentDelta -> onContentDelta(messages, event.accumulated, modelLabel)
             is AgentEvent.ContentReset -> onContentReset(messages)
-            is AgentEvent.Finished -> onFinished(messages, event.content, event.citations, modelLabel, elapsedSeconds)
+            is AgentEvent.Finished -> onFinished(
+                messages, event.content, event.citations, modelLabel, elapsedSeconds, summary = event.summary,
+            )
             is AgentEvent.Incomplete -> onIncomplete(
                 messages, event.content, event.citations, modelLabel, elapsedSeconds, event.reason,
+                summary = event.summary,
             )
             is AgentEvent.Failed -> onFailed(messages, event.error.kind, event.error.message)
             is AgentEvent.Stopped -> onStopped(messages)

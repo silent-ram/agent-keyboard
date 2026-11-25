@@ -34,11 +34,45 @@ data class EngineMessage(
 
 data class EngineToolCall(val id: String, val name: String, val argumentsJson: String)
 
+/**
+ * 一次或多次模型调用的 token 用量(服务端返回);用于成本展示与后续预算控制。
+ * 服务端不返回 usage(OpenAI 兼容实现常见)时保持为 0,不伪造数值。
+ */
+data class TokenUsage(
+    val promptTokens: Long = 0,
+    val completionTokens: Long = 0,
+    val totalTokens: Long = 0,
+) {
+    operator fun plus(other: TokenUsage) = TokenUsage(
+        promptTokens + other.promptTokens,
+        completionTokens + other.completionTokens,
+        totalTokens + other.totalTokens,
+    )
+
+    val isEmpty: Boolean get() = totalTokens == 0L && promptTokens == 0L && completionTokens == 0L
+
+    companion object {
+        val ZERO = TokenUsage()
+    }
+}
+
 /** LLM 单步结果:content(最终回答)或 toolCalls(继续工具循环) */
 sealed class ToolCallResult {
+    /** 服务端返回的 token 用量;未返回时为 [TokenUsage.ZERO] */
+    abstract val usage: TokenUsage
+
     /** [incompleteReason] 非空 = 回答被截断或有分片丢失,内容可展示但不完整。 */
-    data class Content(val text: String, val incompleteReason: String? = null) : ToolCallResult()
-    data class ToolCalls(val content: String, val calls: List<EngineToolCall>) : ToolCallResult()
+    data class Content(
+        val text: String,
+        val incompleteReason: String? = null,
+        override val usage: TokenUsage = TokenUsage.ZERO,
+    ) : ToolCallResult()
+
+    data class ToolCalls(
+        val content: String,
+        val calls: List<EngineToolCall>,
+        override val usage: TokenUsage = TokenUsage.ZERO,
+    ) : ToolCallResult()
 }
 
 /**
@@ -206,7 +240,13 @@ object EngineClient {
                 )
             }
             if (calls.isEmpty()) throw EmptyResponseException()
-            ToolCallResult.ToolCalls(content = message.content()?.orElse("").orEmpty(), calls = calls)
+            ToolCallResult.ToolCalls(
+                content = message.content()?.orElse("").orEmpty(),
+                calls = calls,
+                usage = completion.usage().orElse(null)?.let {
+                    TokenUsage(it.promptTokens(), it.completionTokens(), it.totalTokens())
+                } ?: TokenUsage.ZERO,
+            )
         } else {
             val text = message.content()?.orElse("").orEmpty()
             text.ifBlank { throw EmptyResponseException() }
@@ -218,6 +258,9 @@ object EngineClient {
                     filtered = reason == ChatCompletion.Choice.FinishReason.CONTENT_FILTER,
                     droppedChunks = 0,
                 ),
+                usage = completion.usage().orElse(null)?.let {
+                    TokenUsage(it.promptTokens(), it.completionTokens(), it.totalTokens())
+                } ?: TokenUsage.ZERO,
             )
         }
     }
@@ -232,6 +275,7 @@ object EngineClient {
         private var finishToolCalls = false
         private var finishReason: ChatCompletionChunk.Choice.FinishReason? = null
         private var droppedChunks = 0
+        private var usage = TokenUsage.ZERO
 
         /** 记录一个无法解析而被跳过的分片。 */
         fun markDropped() {
@@ -241,6 +285,10 @@ object EngineClient {
         private data class Agg(val id: StringBuilder, val name: StringBuilder, val arguments: StringBuilder)
 
         fun apply(chunk: ChatCompletionChunk): Pair<String, Boolean> {
+            // usage 只在末尾帧(需 stream_options.include_usage)或非流式响应中出现
+            chunk.usage().orElse(null)?.let { u ->
+                usage = TokenUsage(u.promptTokens(), u.completionTokens(), u.totalTokens())
+            }
             var hasContent = false
             val choice = chunk.choices().firstOrNull()
             if (choice != null) {
@@ -285,7 +333,7 @@ object EngineClient {
                         argumentsJson = v.arguments.toString(),
                     )
                 }
-                return ToolCallResult.ToolCalls(content = content.toString(), calls = list)
+                return ToolCallResult.ToolCalls(content = content.toString(), calls = list, usage = usage)
             }
             val text = content.toString()
             if (text.isBlank()) throw EmptyResponseException()
@@ -296,6 +344,7 @@ object EngineClient {
                     filtered = finishReason == ChatCompletionChunk.Choice.FinishReason.CONTENT_FILTER,
                     droppedChunks = droppedChunks,
                 ),
+                usage = usage,
             )
         }
     }

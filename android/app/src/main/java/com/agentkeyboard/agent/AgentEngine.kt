@@ -56,6 +56,33 @@ internal fun knowledgeAskTask(
 data class AgentError(val kind: String, val message: String)
 
 /**
+ * 单步追踪(可观测性):一次模型请求或一次工具执行的耗时、token 与结果。
+ * 只记录时长与状态,不记录请求/响应正文,避免与现有脱敏策略冲突。
+ */
+data class AgentTraceStep(
+    val step: Int,
+    /** "llm" 或工具 id */
+    val kind: String,
+    val elapsedMs: Long,
+    val usage: com.agentkeyboard.ai.TokenUsage = com.agentkeyboard.ai.TokenUsage.ZERO,
+    val ok: Boolean = true,
+    /** 稳定错误码(ToolErrorCodes / AgentError.kind);正常为 null */
+    val errorCode: String? = null,
+)
+
+/** 一轮任务的运行摘要(与终态事件一起下发) */
+data class AgentRunSummary(
+    val steps: List<AgentTraceStep> = emptyList(),
+    val usage: com.agentkeyboard.ai.TokenUsage = com.agentkeyboard.ai.TokenUsage.ZERO,
+) {
+    val elapsedMs: Long get() = steps.sumOf { it.elapsedMs }
+
+    companion object {
+        val EMPTY = AgentRunSummary()
+    }
+}
+
+/**
  * 确认请求三形态 + llm_call 首次明示(11-权限设计 §6.2)。
  * [canRemember]=false 的形态仅 允许一次/拒绝 两键——派生底线不可豁免。
  */
@@ -120,6 +147,7 @@ sealed class AgentEvent {
         val citations: List<Citation>,
         val sessionId: Long,
         val profileSuggestion: ProfileSuggestion? = null,
+        val summary: AgentRunSummary = AgentRunSummary.EMPTY,
     ) : AgentEvent()
 
     /** 有可展示的部分结果，但证据或步骤不足以声称任务完整完成。 */
@@ -128,6 +156,7 @@ sealed class AgentEvent {
         val citations: List<Citation>,
         val reason: String,
         val sessionId: Long,
+        val summary: AgentRunSummary = AgentRunSummary.EMPTY,
     ) : AgentEvent()
 
     data class Failed(val error: AgentError, val sessionId: Long) : AgentEvent()

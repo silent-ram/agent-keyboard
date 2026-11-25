@@ -1298,6 +1298,35 @@ class AgentRuntimeTest {
     }
 
     @Test
+    fun `token 用量 - 终态事件汇总各步 usage 与工具耗时`() { runBlocking {
+        val h = Harness()
+        h.llmScript += ToolCallResult.ToolCalls(
+            "",
+            listOf(EngineToolCall("c1", "fetch_page", "{}")),
+            com.agentkeyboard.ai.TokenUsage(100, 20, 120),
+        )
+        h.llmScript += ToolCallResult.Content(
+            "最终回答", usage = com.agentkeyboard.ai.TokenUsage(150, 30, 180),
+        )
+        val events = mutableListOf<AgentEvent>()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val engine = h.buildEngine(scope)
+        val collectJob = scope.launch { engine.events.collect { events += it } }
+        withTimeout(5000) { engine.start(Task(TaskType.ASK, "问")).join() }
+        delay(100)
+
+        val finished = events.filterIsInstance<AgentEvent.Finished>().single()
+        // 两轮模型调用累计 prompt/completion
+        assertEquals(250, finished.summary.usage.promptTokens)
+        assertEquals(50, finished.summary.usage.completionTokens)
+        assertEquals(300, finished.summary.usage.totalTokens)
+        // 1 次 llm(第 1 步) + 1 次工具 + 1 次 llm(第 2 步) = 3 条 trace
+        assertEquals(listOf("llm", "fetch_page", "llm"), finished.summary.steps.map { it.kind })
+        collectJob.cancel(); scope.coroutineContext[Job]?.cancelChildren()
+    }
+    }
+
+    @Test
     fun `并发新任务 - 每个Turn使用独立流句柄且停止只关闭当前流`() { runBlocking {
         val h = Harness()
         val firstStarted = CompletableDeferred<Unit>()
