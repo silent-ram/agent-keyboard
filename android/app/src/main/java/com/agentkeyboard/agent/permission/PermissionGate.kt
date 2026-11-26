@@ -317,14 +317,24 @@ class PermissionGate(
             reason = reason,
             canRemember = canRemember,
         )
-        emitConfirmation(AgentEvent.ConfirmationRequired(request))
-        _pendingConfirmation.value = request // P1-2:单槽可恢复,面板未收到事件也能重建确认条
+        // 单槽互斥:并发确认必须排队,否则后者覆盖前者、前者 finally 又清掉后者的确认条。
+        // 先置位再发事件:面板收到事件时一定能读到槽;emit 被取消/抛异常也由 finally 清槽。
+        confirmMutex.lock()
         try {
-            return resolver.resolve(request)
+            _pendingConfirmation.value = request // P1-2:单槽可恢复,面板未收到事件也能重建确认条
+            try {
+                emitConfirmation(AgentEvent.ConfirmationRequired(request))
+                return resolver.resolve(request)
+            } finally {
+                _pendingConfirmation.value = null // 已决定(允许/拒绝/取消)即清空
+            }
         } finally {
-            _pendingConfirmation.value = null // 已决定(允许/拒绝/取消)即清空
+            confirmMutex.unlock()
         }
     }
+
+    /** 确认条单槽互斥锁(concurrency #4) */
+    private val confirmMutex = kotlinx.coroutines.sync.Mutex()
 }
 
 private fun publicTarget(toolId: String): String = when (toolId) {
