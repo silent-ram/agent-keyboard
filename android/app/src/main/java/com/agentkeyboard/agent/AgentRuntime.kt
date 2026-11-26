@@ -26,8 +26,8 @@ import com.agentkeyboard.tools.TOOL_USER_DENIED
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -67,8 +67,8 @@ class AgentRuntime(
         EngineClient.streamWithTools(baseUrl, apiKey, model, messages, tools, handle, onDelta)
     },
     private val clock: () -> Long = System::currentTimeMillis,
-    /** 单轮快捷动作用 1 步;工具任务用 [toolMaxSteps](默认 [DEFAULT_TOOL_STEPS]) */
-    internal val maxSteps: Int = MAX_STEPS,
+    /** 耗时测量用单调时钟:系统时间被用户/NTP 校正时 currentTimeMillis 会回拨,产生负的 elapsedMs */
+    private val monotonicClock: () -> Long = System::nanoTime,
     private val toolMaxSteps: Int = DEFAULT_TOOL_STEPS,
     /** 可注入共享事件流(工厂场景:PermissionGate 的确认条事件与 engine 事件同流) */
     eventsFlow: MutableSharedFlow<AgentEvent>? = null,
@@ -87,9 +87,6 @@ class AgentRuntime(
 ) : AgentEngine {
 
     companion object {
-        /** 默认步数上限;工具任务按此值运行,可在构造时覆盖。 */
-        const val MAX_STEPS = 4
-
         /**
          * 带工具任务的实际步数上限(硬上限 [MAX_STEPS_HARD_CAP])。
          * 4 步只够"检索一次 + 回答",多轮检索/多工具场景会以未完成结束;
@@ -189,6 +186,8 @@ class AgentRuntime(
         var persistedSessionId: Long? = null
         var currentUserMessageId: Long? = null
         val unresolvedCalls = mutableListOf<EngineToolCall>()
+            val traceSteps = mutableListOf<AgentTraceStep>()
+            var runUsage = com.agentkeyboard.ai.TokenUsage.ZERO
         try {
             val cfg = llmConfigProvider()
             if (cfg == null) {
@@ -287,24 +286,24 @@ class AgentRuntime(
             var knowledgeSearchUsed = false
             var knowledgeCitationCount = 0
             var step = 0
-            val traceSteps = mutableListOf<AgentTraceStep>()
-            var runUsage = com.agentkeyboard.ai.TokenUsage.ZERO
             while (step < stepLimit) {
                 step++
                 _events.emit(AgentEvent.Thinking(step))
                 val folded = ContextCompactor.compact(
                     fullMessages, ContextCompactor.foldBudget(contextWindow), currentTurnStartFull
                 )
-                val llmStartedAt = clock()
-                val result = callWithRetry(
+                val llmStartedAt = monotonicClock()
+                val result = callWithRetry(
                     cfg, folded, sessionId = sessionId,
                     tools = if (canPropose && step == 1) tools + ProfileSuggestion.schema else tools,
                     stream = stream,
                     includesProfile = profile.userMd.isNotBlank() || profile.memories.any(String::isNotBlank),
+                    onRetry = { traceSteps += AgentTraceStep(step = step, kind = "llm_retry", elapsedMs = 0L, usage = com.agentkeyboard.ai.TokenUsage.ZERO, ok = false) },
                 )
                 runUsage += result.usage
                 traceSteps += AgentTraceStep(
-                    step = step, kind = "llm", elapsedMs = clock() - llmStartedAt, usage = result.usage,
+                    step = step, kind = "llm",
+                    elapsedMs = (monotonicClock() - llmStartedAt) / 1_000_000, usage = result.usage,
                 )
                 when (result) {                    is ToolCallResult.Content -> {
                         if (safety.unsafeRenderedAnswer(result.text)) {
@@ -358,7 +357,7 @@ class AgentRuntime(
                                     registry.get(c.name)?.id != ToolIds.INSERT_TEXT
                             }
                         val preExecuted: Map<String, Pair<ToolResult, Long>> = if (parallelizable) {
-                            val startedAt = clock()
+                            val startedAt = monotonicClock()
                             kotlinx.coroutines.coroutineScope {
                                 calls.map { c ->
                                     async {
@@ -378,7 +377,7 @@ class AgentRuntime(
                             _events.emit(AgentEvent.StepStarted(tc, step))
                             val permitted = call.name in exposedToolIds && registry.get(call.name) != null
                             if (permitted && call.name == ToolIds.KB_SEARCH) knowledgeSearchUsed = true
-                            val toolStartedAt = clock()
+                            val toolStartedAt = monotonicClock()
                             // 并行分支已执行完:取缓存结果;串行分支现场执行
                             val cached = preExecuted[call.id]
                             val received = when {
@@ -410,7 +409,7 @@ class AgentRuntime(
                             persistToolResult(sessionId, call, toolResult, flagged, step)
                             traceSteps += AgentTraceStep(
                                 step = step, kind = call.name,
-                                elapsedMs = clock() - (cached?.second ?: toolStartedAt),
+                                elapsedMs = (monotonicClock() - (cached?.second ?: toolStartedAt)) / 1_000_000,
                                 ok = toolResult.ok, errorCode = toolResult.errorCode,
                             )
                             unresolvedCalls.remove(call)
@@ -482,7 +481,7 @@ class AgentRuntime(
                 currentUserMessageId?.let { messageDao.deleteById(it) }
                 persistedSessionId?.let { sessionDao.updateStatus(it, SessionStatus.STOPPED) }
             }
-            _events.emit(AgentEvent.Failed(AgentError("LLM_DENIED", ""), persistedSessionId ?: -1))
+            _events.emit(AgentEvent.Failed(AgentError("LLM_DENIED", ""), persistedSessionId ?: -1, AgentRunSummary(traceSteps.toList(), runUsage)))
         } catch (e: CancellationException) {
             withContext(NonCancellable) {
                 persistedSessionId?.let { sessionId ->
@@ -503,7 +502,7 @@ class AgentRuntime(
                     sessionDao.updateStatus(sessionId, SessionStatus.STOPPED)
                 }
                 terminalEventEmitted.set(true)
-                _events.emit(AgentEvent.Stopped(persistedSessionId ?: task.sessionId ?: -1))
+                _events.emit(AgentEvent.Stopped(persistedSessionId ?: task.sessionId ?: -1, AgentRunSummary(traceSteps.toList(), runUsage)))
             }
             throw e
         } catch (e: Exception) {
@@ -520,7 +519,7 @@ class AgentRuntime(
                 }
             }
             val error = if (e is UnsafeAgentOutput) AgentError("UNSAFE_OUTPUT", "") else toAgentError(e)
-            _events.emit(AgentEvent.Failed(error, persistedSessionId ?: -1))
+            _events.emit(AgentEvent.Failed(error, persistedSessionId ?: -1, AgentRunSummary(traceSteps.toList(), runUsage)))
         }
     }
 
@@ -606,6 +605,7 @@ class AgentRuntime(
         tools: List<com.agentkeyboard.tools.ToolSchema>,
         stream: com.agentkeyboard.ai.StreamingHandle,
         includesProfile: Boolean = false,
+        onRetry: (Exception) -> Unit = {},
     ): ToolCallResult {
         val model = cfg.model?.trim().takeUnless { it.isNullOrEmpty() }
             ?: com.agentkeyboard.data.ModelConfig.pickModel(cfg.baseUrl)
@@ -623,12 +623,14 @@ class AgentRuntime(
                     _events.emit(AgentEvent.ContentDelta(accumulated))
                 }
             } catch (e: CancellationException) {
-                _events.tryEmit(AgentEvent.ContentReset)
+                // 撤回必须可靠：与 ContentDelta 同用挂起式 emit
+                _events.emit(AgentEvent.ContentReset)
                 throw e
             } catch (e: Exception) {
                 // 重试会从头重发,已显示的半截文字必须撤回,否则会与重试结果拼接成错误内容
-                _events.tryEmit(AgentEvent.ContentReset)
+                _events.emit(AgentEvent.ContentReset)
                 if (ErrorClassifier.isRetryable(e) && attempt < MAX_TIMEOUT_RETRIES) {
+                    onRetry(e)
                     retryDelay(backoffMs(attempt))
                     attempt++
                     continue

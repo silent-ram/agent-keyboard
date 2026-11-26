@@ -159,10 +159,10 @@ sealed class AgentEvent {
         val summary: AgentRunSummary = AgentRunSummary.EMPTY,
     ) : AgentEvent()
 
-    data class Failed(val error: AgentError, val sessionId: Long) : AgentEvent()
+    data class Failed(val error: AgentError, val sessionId: Long, val summary: AgentRunSummary = AgentRunSummary.EMPTY) : AgentEvent()
 
     /** 用户取消(已生成部分保留,标注已停止) */
-    data class Stopped(val sessionId: Long) : AgentEvent()
+    data class Stopped(val sessionId: Long, val summary: AgentRunSummary = AgentRunSummary.EMPTY) : AgentEvent()
 }
 
 /**

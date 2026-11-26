@@ -1330,6 +1330,90 @@ class AgentRuntimeTest {
     }
 
     @Test
+    fun `trace - 超时重试记一步 llm_retry 且 ok=false`() { runBlocking {
+        val h = Harness()
+        h.throwTimeoutTimes = 1
+        h.llmScript += ToolCallResult.Content("重试后回答", usage = com.agentkeyboard.ai.TokenUsage(10, 5, 15))
+        val events = mutableListOf<AgentEvent>()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val engine = h.buildEngine(scope)
+        val collectJob = scope.launch { engine.events.collect { events += it } }
+        withTimeout(5000) { engine.start(Task(TaskType.ASK, "问")).join() }
+        delay(100)
+
+        val steps = events.filterIsInstance<AgentEvent.Finished>().single().summary.steps
+        assertEquals(listOf("llm_retry", "llm"), steps.map { it.kind })
+        assertFalse(steps[0].ok)
+        assertEquals(0, steps[0].usage.totalTokens)
+        assertTrue(steps[1].ok)
+        collectJob.cancel(); scope.coroutineContext[Job]?.cancelChildren()
+    }
+    }
+
+    @Test
+    fun `终态 summary - 中途异常 Failed 携带已记录步骤与用量`() { runBlocking {
+        val h = Harness()
+        var calls = 0
+        val events = mutableListOf<AgentEvent>()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val engine = h.buildEngine(scope, llm = { _, _, _, _, _, _, _ ->
+            calls++
+            if (calls == 1) {
+                ToolCallResult.ToolCalls(
+                    "",
+                    listOf(EngineToolCall("c1", "fetch_page", "{}")),
+                    com.agentkeyboard.ai.TokenUsage(100, 20, 120),
+                )
+            } else {
+                throw RuntimeException("bad gateway")
+            }
+        })
+        val collectJob = scope.launch { engine.events.collect { events += it } }
+        withTimeout(5000) { engine.start(Task(TaskType.ASK, "问")).join() }
+        delay(100)
+
+        val failed = events.filterIsInstance<AgentEvent.Failed>().single()
+        assertEquals(listOf("llm", "fetch_page"), failed.summary.steps.map { it.kind })
+        assertEquals(120, failed.summary.usage.totalTokens)
+        collectJob.cancel(); scope.coroutineContext[Job]?.cancelChildren()
+    }
+    }
+
+    @Test
+    fun `终态 summary - 取消时 Stopped 携带已记录步骤`() { runBlocking {
+        val h = Harness()
+        val release = CompletableDeferred<Unit>()
+        var calls = 0
+        val events = mutableListOf<AgentEvent>()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val engine = h.buildEngine(scope, llm = { _, _, _, _, _, _, _ ->
+            calls++
+            if (calls == 1) {
+                ToolCallResult.ToolCalls(
+                    "",
+                    listOf(EngineToolCall("c1", "fetch_page", "{}")),
+                    com.agentkeyboard.ai.TokenUsage(100, 20, 120),
+                )
+            } else {
+                release.await()
+                ToolCallResult.Content("never")
+            }
+        })
+        val collectJob = scope.launch { engine.events.collect { events += it } }
+        val job = engine.start(Task(TaskType.ASK, "问"))
+        delay(200)
+        engine.cancel()
+        withTimeout(5000) { job.join() }
+        delay(100)
+
+        val stopped = events.filterIsInstance<AgentEvent.Stopped>().single()
+        assertEquals(listOf("llm", "fetch_page"), stopped.summary.steps.map { it.kind })
+        assertEquals(120, stopped.summary.usage.totalTokens)
+        collectJob.cancel(); scope.coroutineContext[Job]?.cancelChildren()
+    }
+    }
+
+    @Test
     fun `步数上限 - 工具任务默认可超过旧的4步`() { runBlocking {
         val h = Harness()
         // 5 轮工具调用后给出回答:旧的 MAX_STEPS=4 会在第 4 步就判未完成
