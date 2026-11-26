@@ -107,11 +107,14 @@ object ContextCompactor {
     /**
      * 语义化压缩:取开头一段 + 结尾一段,中间标注省略。
      * 工具结果的关键结论常在末尾(结论、错误码、要点),只留开头会丢掉最有用的部分。
+     * 输出总长度不超过 [limit]:预算里先扣掉标注本身,否则"压缩"反而会超预算。
      */
     internal fun semanticClip(text: String, limit: Int): String {
         if (text.length <= limit) return text
-        val headLimit = (limit * 2) / 3
-        val tailLimit = limit - headLimit
+        val budget = (limit - OMITTED_MARK.length - 2).coerceAtLeast(limit / 2)
+        if (budget <= 0) return text.take(limit)
+        val headLimit = (budget * 2) / 3
+        val tailLimit = budget - headLimit
         val head = clipAtBoundary(text, headLimit)
         val tail = clipAtBoundaryFromEnd(text, tailLimit)
         return head + "\n" + OMITTED_MARK + "\n" + tail
@@ -132,17 +135,23 @@ object ContextCompactor {
         if (limit <= 0) return ""
         if (text.length <= limit) return text
         val window = text.substring(text.length - limit)
+        // 段落分隔是两个字符,单换行算一个:分别找,取更靠前的起点并跳过完整分隔符
         val paragraph = window.indexOf("\n\n").takeIf { it >= 0 }
         val sentence = SENTENCE_BREAKS
+            .filter { it != '\n' }
             .map { c -> window.indexOf(c) }
             .filter { it >= 0 }
             .minOrNull()
-        val cut = minOf(paragraph ?: Int.MAX_VALUE, sentence ?: Int.MAX_VALUE)
-        return if (cut != Int.MAX_VALUE && cut < limit / 2) {
-            window.substring(cut + 1).trimStart()
-        } else {
-            window.trimStart()
-        }
+        val singleBreak = window.indexOf('\n').takeIf { it >= 0 }
+        val cut = minOf(
+            paragraph ?: Int.MAX_VALUE,
+            sentence ?: Int.MAX_VALUE,
+            singleBreak ?: Int.MAX_VALUE,
+        )
+        if (cut == Int.MAX_VALUE || cut >= limit / 2) return window.trimStart()
+        // 跳到分隔符之后:段落分隔占两位
+        val skip = if (paragraph != null && cut == paragraph) 2 else 1
+        return window.substring((cut + skip).coerceAtMost(window.length)).trimStart()
     }
 
     private fun unwrap(content: String): String {
