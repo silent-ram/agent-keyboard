@@ -76,41 +76,53 @@ object AgentFactory {
                 db, com.agentkeyboard.data.SettingsRepository(context.applicationContext),
             )::profileFor,
             protectedConfigProvider = { protectedConfig(context) },
+            // 资料命中指令样规则后的复核:走和对话相同的模型与通道,不带工具,只回一个词(ContentJudge)
+            contentJudge = { cfg, messages, handle ->
+                val reply = EngineClient.streamWithTools(
+                    cfg.baseUrl, cfg.apiKey, modelName(cfg), messages, emptyList(), handle,
+                ) { }
+                (reply as? com.agentkeyboard.ai.ToolCallResult.Content)?.text
+            },
         )
         return AgentKit(engine, gate, registry, sharedEvents, mcpBridge)
     }
 
-    internal suspend fun protectedConfig(context: Context): List<String> {
+    /**
+     * 需要保护的配置值。凭据与标识分开给:Key、令牌出现在哪里都算泄露;模型与服务商名称、服务地址、
+     * 资料库名称/ID 不是秘密,只遮盖模型说出来的、用户没提过的那些(口径见 [AgentContentSafety])。
+     */
+    internal suspend fun protectedConfig(context: Context): ProtectedConfig {
         val config = ModelStore(context.applicationContext).privacySnapshot()
-        return buildList {
-            addAll(config.providerKeys.values)
-            addAll(listOfNotNull(config.knowledgeKey, config.tavilyKey))
-            add(config.knowledge.knowledgeId)
-            add(config.knowledge.knowledgeName)
-            addAll(AgentContentSafety.endpointValues(config.knowledge.baseUrl))
-            addAll(listOf("智谱知识库", "Zhipu", "open.bigmodel.cn", "Tavily", "api.tavily.com"))
-            config.models.providers.forEach {
-                add(it.name)
-                addAll(AgentContentSafety.endpointValues(it.baseUrl))
-            }
-            config.models.models.forEach {
-                add(it.modelId)
-                if (it.displayName.isNotBlank()) add(it.displayName)
-            }
-            val mcpStore = com.agentkeyboard.mcp.McpServerStore(context.applicationContext)
-            mcpStore.list().forEach {
-                add(it.name)
-                addAll(AgentContentSafety.endpointValues(it.url))
-                mcpStore.decryptedAuth(it)?.let { auth ->
-                    add(auth)
-                    add(auth.substringAfter(' ', auth))
-                }
+        val secrets = mutableListOf<String>()
+        val identifiers = mutableListOf<String>()
+        secrets += config.providerKeys.values
+        secrets += listOfNotNull(config.knowledgeKey, config.tavilyKey)
+        identifiers += config.knowledge.knowledgeId
+        identifiers += config.knowledge.knowledgeName
+        identifiers += AgentContentSafety.endpointValues(config.knowledge.baseUrl)
+        identifiers += listOf("智谱知识库", "Zhipu", "open.bigmodel.cn", "Tavily", "api.tavily.com")
+        config.models.providers.forEach {
+            identifiers += it.name
+            identifiers += AgentContentSafety.endpointValues(it.baseUrl)
+        }
+        config.models.models.forEach {
+            identifiers += it.modelId
+            if (it.displayName.isNotBlank()) identifiers += it.displayName
+        }
+        val mcpStore = com.agentkeyboard.mcp.McpServerStore(context.applicationContext)
+        mcpStore.list().forEach {
+            identifiers += it.name
+            identifiers += AgentContentSafety.endpointValues(it.url)
+            mcpStore.decryptedAuth(it)?.let { auth ->
+                secrets += auth
+                secrets += auth.substringAfter(' ', auth)
             }
         }
+        return ProtectedConfig(identifiers = identifiers, secrets = secrets)
     }
 
     internal suspend fun historySafety(context: Context): AgentContentSafety? = try {
-        AgentContentSafety(protectedConfig(context))
+        protectedConfig(context).let { AgentContentSafety(identifiers = it.identifiers, secrets = it.secrets) }
     } catch (e: kotlinx.coroutines.CancellationException) {
         throw e
     } catch (_: Exception) {

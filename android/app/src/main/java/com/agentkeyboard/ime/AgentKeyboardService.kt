@@ -496,6 +496,7 @@ class AgentKeyboardService : InputMethodService() {
                         oldText = pendingAction?.takeIf { it.replaceMode }?.let { pendingSource },
                         fromSelection = pendingFromSelection,
                         editorGeneration = pendingAnswerEditorGeneration,
+                        summary = event.summary,
                     )
                 )
                 pendingAction = null
@@ -512,6 +513,7 @@ class AgentKeyboardService : InputMethodService() {
                     PanelReducer.onIncomplete(
                         panelState.messages.toList(), event.content, event.citations, panelState.modelLabel, null, event.reason,
                         editorGeneration = pendingAnswerEditorGeneration,
+                        summary = event.summary,
                     ),
                 )
                 pendingAction = null
@@ -528,7 +530,8 @@ class AgentKeyboardService : InputMethodService() {
                 panelState.busy = false
                 kbState.askBadge = KeyboardBadge.FAILED
                 pendingAnswerEditorGeneration = null
-                Log.w(TAG, "agent failed, kind=${event.error.kind} session=${event.sessionId}")
+                // 只有分类、状态码与计数,不含异常原文与请求内容
+                Log.w(TAG, "agent failed, ${com.agentkeyboard.agent.RunDiagnostics.describe(event.error, event.summary)} session=${event.sessionId}")
             }
             is AgentEvent.ContentDelta -> {
                 replaceMessages(PanelReducer.apply(panelState.messages.toList(), event, panelState.modelLabel, null))

@@ -5,7 +5,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/** 多轮上下文折叠(FR-B10):预算 = contextWindow × 50%;旧轮工具结果压缩为摘要行,当前轮全文 */
+/** 多轮上下文折叠(FR-B10):预算 = contextWindow × 70%;预算内不折叠,超预算时逐级收紧,当前轮全文 */
 class ContextCompactorTest {
 
     @Test
@@ -15,23 +15,32 @@ class ContextCompactorTest {
     }
 
     @Test
-    fun `折叠预算 - 8k窗口取50百分`() {
-        assertEquals(4000, ContextCompactor.foldBudget(8000))
+    fun `折叠预算 - 窗口的70百分 下限256`() {
+        assertEquals(5600, ContextCompactor.foldBudget(8000))
+        assertEquals(140_000, ContextCompactor.foldBudget(200_000))
+        assertEquals(256, ContextCompactor.foldBudget(100))
+    }
+
+    private fun oldTurnWithTools() = listOf(
+        EngineMessage("system", "sys"),
+        EngineMessage("user", "第一轮问题"),
+        EngineMessage("assistant", "", toolCalls = emptyList()),
+        EngineMessage("tool", "very long tool result ".repeat(50), toolCallId = "c1", toolName = "web_search"),
+        EngineMessage("user", "第二轮问题"),
+        EngineMessage("tool", "当前轮工具结果: kb_search 命中3条 chunk 原文", toolCallId = "c2", toolName = "kb_search"),
+    )
+
+    @Test
+    fun `预算内不折叠 - 原样发送`() {
+        val messages = oldTurnWithTools()
+        assertEquals(messages, ContextCompactor.compact(messages, budgetTokens = 4000, currentTurnStart = 4))
     }
 
     @Test
-    fun `旧轮工具结果折叠为摘要行 - 当前轮全文`() {
-        val oldTool = EngineMessage("tool", "very long tool result ".repeat(50), toolCallId = "c1", toolName = "web_search")
-        val messages = listOf(
-            EngineMessage("system", "sys"),
-            EngineMessage("user", "第一轮问题"),
-            EngineMessage("assistant", "", toolCalls = emptyList()),
-            oldTool,
-            EngineMessage("user", "第二轮问题"),
-            EngineMessage("tool", "当前轮工具结果: kb_search 命中3条 chunk 原文", toolCallId = "c2", toolName = "kb_search"),
-        )
-        val currentTurnStart = 4
-        val folded = ContextCompactor.compact(messages, budgetTokens = 4000, currentTurnStart = currentTurnStart)
+    fun `超预算 - 旧轮工具结果折叠为摘要行 - 当前轮全文`() {
+        val messages = oldTurnWithTools()
+        val oldTool = messages[3]
+        val folded = ContextCompactor.compact(messages, budgetTokens = 200, currentTurnStart = 4)
         val foldedOld = folded.first { it.toolCallId == "c1" }
         val current = folded.first { it.toolCallId == "c2" }
         assertTrue(foldedOld.content.startsWith("[工具结果已折叠]"))
@@ -39,6 +48,105 @@ class ContextCompactorTest {
         assertEquals("当前轮工具结果: kb_search 命中3条 chunk 原文", current.content) // 当前轮全文
         // toolCallId 配对信息保留(协议必需)
         assertEquals("c1", foldedOld.toolCallId)
+        // 预算内即停:只有工具结果被折叠,旧轮的问句原样保留
+        assertEquals("第一轮问题", folded.first { it.role == "user" && it.content.startsWith("第一轮") }.content)
+    }
+
+    /** 短结果加前缀与包裹反而更长:折叠只增不减,这种结果原样保留 */
+    @Test
+    fun `折叠不增量 - 短工具结果加摘要前缀后反而更长时保持原文`() {
+        val short = EngineMessage("tool", "工具结果c1", toolCallId = "c1", toolName = "web_search")
+        val out = ContextCompactor.foldOldToolResults(listOf(EngineMessage("system", "sys"), short), currentTurnStart = 2)
+        assertEquals(short, out[1])
+    }
+
+    /**
+     * 方案 3.2:每一级折叠都不能破坏 assistant.toolCalls 与 tool 回复的配对——
+     * 孤儿的 tool 消息或没有回复的 tool_calls 会被 OpenAI 兼容 API 以 400 拒绝。
+     */
+    @Test
+    fun compact_keepsToolCallIdsWhenFolding() {
+        fun call(id: String) = com.agentkeyboard.ai.EngineToolCall(id, "web_search", "{}")
+        fun tool(id: String) = EngineMessage("tool", "very long tool result ".repeat(50), toolCallId = id, toolName = "web_search")
+        val messages = listOf(
+            EngineMessage("system", "sys"),
+            EngineMessage("user", "第一轮问题"),
+            EngineMessage("assistant", "", toolCalls = listOf(call("c1"))),
+            tool("c1"),
+            EngineMessage("user", "第二轮问题"),
+            EngineMessage("assistant", "第二轮回答"),
+            EngineMessage("assistant", "", toolCalls = listOf(call("c2"))),
+            tool("c2"),
+            EngineMessage("user", "当前问题"),
+            EngineMessage("assistant", "", toolCalls = listOf(call("c3"))),
+            tool("c3"),
+            EngineMessage("assistant", "当前回答"),
+        )
+        // 800 = 只折叠旧轮工具结果;350 = 旧轮再整轮丢弃;200 = 当前轮也超预算
+        for (budget in listOf(800, 350, 200)) {
+            val out = sanitizePairs(ContextCompactor.compact(messages, budgetTokens = budget, currentTurnStart = 8))
+            for (i in out.indices) {
+                val m = out[i]
+                if (m.role == "tool") {
+                    val id = m.toolCallId ?: error("tool 消息缺 toolCallId")
+                    assertTrue("孤儿 tool 消息:$id(预算 $budget)", out.subList(0, i).any { prev -> prev.toolCalls.orEmpty().any { it.id == id } })
+                }
+                m.toolCalls?.forEach { declared ->
+                    assertTrue("没有回复的 tool_call:${declared.id}(预算 $budget)", out.subList(i + 1, out.size).any { it.role == "tool" && it.toolCallId == declared.id })
+                }
+            }
+            // 当前轮从不丢弃
+            assertTrue(out.any { it.content == "当前问题" })
+            assertTrue(out.any { it.toolCallId == "c3" })
+        }
+        // 800:两轮旧工具结果都折成摘要,toolCallId 不变
+        val folded = ContextCompactor.compact(messages, budgetTokens = 800, currentTurnStart = 8)
+        assertEquals(setOf("c1", "c2"), folded.filter { it.content.startsWith("[工具结果已折叠]") }.mapNotNull { it.toolCallId }.toSet())
+        // 350:更早的一轮放不下被整轮丢弃(没有回答可留),后一轮只留问答;只剩当前轮的 c3
+        val dropped = ContextCompactor.compact(messages, budgetTokens = 350, currentTurnStart = 8)
+        assertEquals(listOf("c3"), dropped.mapNotNull { it.toolCallId })
+        assertTrue(dropped.any { it.content == ContextCompactor.TRIMMED_NOTE })
+    }
+
+    @Test
+    fun `超预算 - 旧轮先精简为问句加回答 角色不变并带注记`() {
+        val messages = listOf(
+            EngineMessage("system", "sys"),
+            EngineMessage("user", "第一问:" + "细节".repeat(100)),
+            EngineMessage("assistant", "第一答:" + "内容".repeat(300)),
+            EngineMessage("user", "第二问"),
+            EngineMessage("assistant", "第二答"),
+            EngineMessage("user", "当前轮"),
+            EngineMessage("assistant", "当前回答"),
+        )
+        val folded = ContextCompactor.compact(messages, budgetTokens = 300, currentTurnStart = 5)
+        assertEquals(listOf("system", "system", "user", "assistant", "user", "assistant", "user", "assistant"), folded.map { it.role })
+        assertEquals(ContextCompactor.TRIMMED_NOTE, folded[1].content)
+        val question = folded[2]
+        val answer = folded[3]
+        assertTrue(question.content.startsWith("第一问:"))
+        assertTrue("问句被截短并标注", question.content.endsWith("…(已精简)") && question.content.length < messages[1].content.length)
+        assertTrue("回答被截短并标注", answer.content.endsWith("…(已精简)") && answer.content.length < messages[2].content.length)
+        // 较新的旧轮没动
+        assertEquals("第二问", folded[4].content)
+        assertEquals("第二答", folded[5].content)
+    }
+
+    @Test
+    fun `超预算 - 精简后仍放不下 自最旧整轮丢弃`() {
+        val messages = listOf(
+            EngineMessage("system", "sys"),
+            EngineMessage("user", "第一问:" + "细节".repeat(100)),
+            EngineMessage("assistant", "第一答:" + "内容".repeat(300)),
+            EngineMessage("user", "第二问"),
+            EngineMessage("assistant", "第二答"),
+            EngineMessage("user", "当前轮"),
+            EngineMessage("assistant", "当前回答"),
+        )
+        val folded = ContextCompactor.compact(messages, budgetTokens = 60, currentTurnStart = 5)
+        assertEquals(listOf("system", "system", "user", "assistant", "user", "assistant"), folded.map { it.role })
+        assertTrue(folded.none { it.content.startsWith("第一问") || it.content.startsWith("第一答") })
+        assertTrue(folded.any { it.content == "第二问" })
     }
 
     @Test

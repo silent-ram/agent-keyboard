@@ -175,6 +175,20 @@ class ToolsTest {
         assertTrue(wrapped.endsWith(ToolResultWrapper.CLOSE))
     }
 
+    /** 聊天模板的角色分隔符在讲模板的文档里很常见:回喂前改成全角使其失效,而不是把资料判成不安全 */
+    @Test
+    fun `wrap - 聊天模板的角色分隔符被中和`() {
+        val wrapped = ToolResultWrapper.wrap("ChatML 用 <|im_start|> 和 <|im_end|>，Llama 用 [INST] 和 [/INST] 包住输入。")
+        assertFalse(wrapped.contains("<|im_start|>"))
+        assertFalse(wrapped.contains("<|im_end|>"))
+        assertFalse(wrapped.contains("[INST]"))
+        assertFalse(wrapped.contains("[/INST]"))
+        assertTrue(wrapped.contains("＜|im_start|＞"))
+        assertTrue(wrapped.contains("［/INST］"))
+        assertEquals(1, countOf(wrapped, ToolResultWrapper.OPEN))
+        assertTrue(wrapped.endsWith(ToolResultWrapper.CLOSE))
+    }
+
     @Test
     fun `P2-8 encodeTargetUrl - fragment剥离与空格非ASCII编码`() {
         assertEquals("https://a.com/x", FetchPageTool.encodeTargetUrl("https://a.com/x#sec"))

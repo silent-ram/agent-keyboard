@@ -12,6 +12,7 @@ import com.agentkeyboard.data.db.PermissionStateEntity
 import com.agentkeyboard.data.db.PermissionStates
 import com.agentkeyboard.data.db.UserContentFlags
 import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -30,11 +31,18 @@ const val TARGET_MODEL_SERVICE = "模型服务"
 const val TARGET_LOCAL = "本机"
 
 /**
+ * 默认可直接使用的出网工具:资料检索与联网搜索不弹授权询问,也不读取历史授权记录;
+ * 只在命中派生底线(请求参数带着用户原文)时当场确认。
+ */
+private val DEFAULT_ALLOWED_TOOLS = setOf("kb_search", "web_search")
+
+/**
  * 权限门控(11-权限设计 §3/§4/§5):
  * - llm_call:首次明示一次(必须同意),同意后记忆 ALWAYS_ALLOW;不做派生判定(§4.1);
- * - 出网工具(web_search/fetch_page):
- *   UNASKED → 首次确认条;ASK_EVERY_TIME → 精简确认条;ALWAYS_ALLOW → classifyOutbound,
- *   含原文 → 派生底线确认条(仅 允许一次/拒绝,不可记忆、不可豁免);
+ * - 出网工具:kb_search / web_search 默认可用([DEFAULT_ALLOWED_TOOLS]),不弹授权询问;
+ *   其余(fetch_page / MCP 工具)UNASKED → 首次确认条;ASK_EVERY_TIME → 精简确认条;
+ *   ALWAYS_ALLOW → 只做派生判定;
+ * - 派生底线不可豁免:任何放行路径上,请求参数含用户原文 → 派生底线确认条(仅 允许一次/拒绝,不可记忆);
  * - 拒绝 → Denied,由调用方回喂 ToolResult.error("user_denied");
  * - 每次门控结果写 activity_log，记录操作类别和结果。
  * - 任务级"本次允许":同任务内同工具不重复弹(边界表 #3),派生命中除外(每次判定)。
@@ -45,6 +53,8 @@ class PermissionGate(
     private val resolver: ConfirmationResolver,
     private val emitConfirmation: suspend (AgentEvent.ConfirmationRequired) -> Unit = {},
     private val clock: () -> Long = System::currentTimeMillis,
+    /** 时长测量用单调时钟(系统时间被校正会回拨) */
+    private val monotonicClock: () -> Long = System::nanoTime,
     private val llmDisclosureTitle: String = "",
     private val llmDisclosureBody: String = "",
 ) {
@@ -65,8 +75,18 @@ class PermissionGate(
     private val _pendingConfirmation = MutableStateFlow<ConfirmationRequest?>(null)
     val pendingConfirmation: StateFlow<ConfirmationRequest?> get() = _pendingConfirmation
 
+    /**
+     * 本任务内等待用户决定(确认条/明示条)的累计时长。确认条按设计不超时,用户考虑多久都不该
+     * 吃掉运行时的时间预算,AgentRuntime 用 [userWaitMs] 把这段从预算里扣除。
+     */
+    private val userWaitNanos = AtomicLong()
+
+    /** 本任务内等待用户决定的累计毫秒数 */
+    val userWaitMs: Long get() = userWaitNanos.get() / 1_000_000
+
     suspend fun beginTask() {
         synchronized(taskAllowed) { taskAllowed.clear() }
+        userWaitNanos.set(0)
     }
 
     /** 「总是允许」记忆(UI 点「总是允许」按钮 / 设置页改写时调用) */
@@ -139,6 +159,22 @@ class PermissionGate(
             .joinToString("") { "%02x".format(it) }
 
     /**
+     * 这次工具调用是否可能弹确认条。只读判定,不落日志、不改状态:
+     * 运行时据此决定调用能否与同批次的其它调用并发——会弹确认条的调用必须单独按序执行,
+     * 否则用户拒绝其中一个时,其余请求已经发出。
+     */
+    suspend fun mayPrompt(toolId: String, paramsText: String, taint: TaintSnapshot): Boolean {
+        // 派生底线逐次判定、不可豁免:载荷含用户原文就一定当场确认
+        if (ClassifyOutbound.classify(paramsText, taint) is Decision.Confirm) return true
+        if (toolId in DEFAULT_ALLOWED_TOOLS) return false
+        if (synchronized(taskAllowed) { toolId in taskAllowed }) return false
+        return when (permissionStateDao.byTool(toolId)?.state) {
+            PermissionStates.ALWAYS_ALLOW -> false
+            else -> true
+        }
+    }
+
+    /**
      * 出网工具执行前判定。
      * [paramsText]:本次出网载荷文本(query/URL);[target]:目标类别(搜索服务/网页)。
      */
@@ -149,17 +185,9 @@ class PermissionGate(
         taint: TaintSnapshot,
         sessionId: Long?,
     ): GateResult {
-        if (toolId == "kb_search") {
-            val derived = ClassifyOutbound.classify(paramsText, taint) as? Decision.Confirm
-            val allowed = confirm(
-                toolId, if (derived == null) ConfirmationKind.EVERY_TIME else ConfirmationKind.DERIVED_BOTTOM_LINE,
-                reason = derived?.reason, canRemember = false,
-            )
-            val outcome = if (allowed) LogOutcomes.ALLOWED_ONCE else LogOutcomes.DENIED
-            val contains = derived?.let { flagOf(it.source) } ?: UserContentFlags.NONE
-            log(toolId, outcome, contains, if (allowed) "你已确认" else "你已拒绝", sessionId)
-            return if (allowed) GateResult.Allowed(outcome, contains) else GateResult.Denied
-        }
+        // 资料检索与联网搜索默认可用:不弹授权询问,也不读取历史授权记录;派生底线照常生效
+        val state = if (toolId in DEFAULT_ALLOWED_TOOLS) PermissionStates.ALWAYS_ALLOW
+            else permissionStateDao.byTool(toolId)?.state ?: PermissionStates.UNASKED
         // 任务级"本次允许":同任务同工具不重复弹「授权询问」,
         // 但派生底线(§4)逐次判定不豁免——载荷含用户原文仍必须当场确认(P0-1 修正)
         val taskCached = synchronized(taskAllowed) { toolId in taskAllowed }
@@ -184,8 +212,6 @@ class PermissionGate(
                 }
             }
         }
-
-        val state = permissionStateDao.byTool(toolId)?.state ?: PermissionStates.UNASKED
 
         when (state) {
             PermissionStates.ALWAYS_ALLOW -> {
@@ -319,6 +345,7 @@ class PermissionGate(
         )
         // 单槽互斥:并发确认必须排队,否则后者覆盖前者、前者 finally 又清掉后者的确认条。
         // 先置位再发事件:面板收到事件时一定能读到槽;emit 被取消/抛异常也由 finally 清槽。
+        val waitStarted = monotonicClock()
         confirmMutex.lock()
         try {
             _pendingConfirmation.value = request // P1-2:单槽可恢复,面板未收到事件也能重建确认条
@@ -329,6 +356,7 @@ class PermissionGate(
                 _pendingConfirmation.value = null // 已决定(允许/拒绝/取消)即清空
             }
         } finally {
+            userWaitNanos.addAndGet(monotonicClock() - waitStarted)
             confirmMutex.unlock()
         }
     }

@@ -66,6 +66,9 @@ sealed class ToolCallResult {
         val text: String,
         val incompleteReason: String? = null,
         override val usage: TokenUsage = TokenUsage.ZERO,
+        /** 服务端 finish_reason=length(达到输出上限)/ content_filter(内容过滤),运行时据此填 StopReason */
+        val truncatedByLength: Boolean = false,
+        val filtered: Boolean = false,
     ) : ToolCallResult()
 
     data class ToolCalls(
@@ -86,6 +89,17 @@ class StreamingHandle {
     /** M1 批次 3:cancel 早于流建立(建连期)时置位,createStreaming 返回后立即中断 */
     @Volatile
     var cancelRequested: Boolean = false
+
+    /**
+     * 本次请求的超时(连接/读/总时长),由运行时按本轮预算设置;null = 用客户端默认值。
+     * 经 RequestOptions 按请求下发,客户端与连接池仍按 baseUrl 复用。
+     */
+    @Volatile
+    var requestTimeout: com.openai.core.Timeout? = null
+
+    /** 收到首个数据块时回调一次(运行时据此统计首 token 耗时) */
+    @Volatile
+    var onFirstChunk: (() -> Unit)? = null
 
     fun cancel() {
         cancelRequested = true
@@ -119,6 +133,17 @@ object EngineClient {
         .read(Duration.ofSeconds(TIMEOUT_SECONDS))
         .write(Duration.ofSeconds(TIMEOUT_SECONDS))
         .request(Duration.ofSeconds(REQUEST_TIMEOUT_SECONDS))
+        .build()
+
+    /**
+     * 模型复核请求的超时(ContentJudge):只需要回一个词,比对话请求短得多。
+     * 必须落在 HTTP 层——复核里的阻塞调用不响应协程取消,只靠 withTimeout 掐不住。
+     */
+    internal fun judgeRequestTimeout(): com.openai.core.Timeout = com.openai.core.Timeout.builder()
+        .connect(Duration.ofSeconds(10))
+        .read(Duration.ofSeconds(15))
+        .write(Duration.ofSeconds(15))
+        .request(Duration.ofSeconds(20))
         .build()
 
     const val ROLE_SYSTEM = "system"
@@ -204,8 +229,14 @@ object EngineClient {
         val client = clientFor(baseUrl, apiKey)
         // M1 批次 3:每次调用开始清残留取消标志(单例 handle 跨任务复用,标志不清会让新任务启动即被杀)
         handle.cancelRequested = false
+        val options = handle.requestTimeout
+            ?.let { com.openai.core.RequestOptions.builder().timeout(it).build() }
+            ?: com.openai.core.RequestOptions.none()
         val response: StreamResponse<ChatCompletionChunk> =
-            client.chat().completions().createStreaming(buildParams(model, messages, tools, stream = true))
+            client.chat().completions().createStreaming(
+                buildParams(model, messages, tools, stream = true),
+                options,
+            )
         handle.cancelFn = { runCatching { response.close() } }
         if (handle.cancelRequested) {
             // cancel 先于流建立到达(建连期取消):流一旦建立立即关闭并中止
@@ -215,7 +246,12 @@ object EngineClient {
         try {
             val agg = StreamAggregator()
             val iterator = response.stream().iterator()
+            var seenChunk = false
             while (iterator.hasNext()) {
+                if (!seenChunk) {
+                    seenChunk = true
+                    handle.onFirstChunk?.invoke()
+                }
                 // P3(评审修正单):per-chunk 降级——部分服务端流不发 tool_calls.index
                 // (openai-java required accessor/反序列化抛异常),跳过该 chunk 继续读,
                 // 而不是让整个流失败(content 在坏 chunk 内的部分一并丢弃属可接受降级)
@@ -260,16 +296,16 @@ object EngineClient {
             val text = message.content()?.orElse("").orEmpty()
             text.ifBlank { throw EmptyResponseException() }
             val reason = choice.finishReason()
+            val truncatedByLength = reason == ChatCompletion.Choice.FinishReason.LENGTH
+            val filtered = reason == ChatCompletion.Choice.FinishReason.CONTENT_FILTER
             ToolCallResult.Content(
                 text,
-                incompleteReason(
-                    truncatedByLength = reason == ChatCompletion.Choice.FinishReason.LENGTH,
-                    filtered = reason == ChatCompletion.Choice.FinishReason.CONTENT_FILTER,
-                    droppedChunks = 0,
-                ),
+                incompleteReason(truncatedByLength = truncatedByLength, filtered = filtered, droppedChunks = 0),
                 usage = completion.usage().orElse(null)?.let {
                     TokenUsage(it.promptTokens(), it.completionTokens(), it.totalTokens())
                 } ?: TokenUsage.ZERO,
+                truncatedByLength = truncatedByLength,
+                filtered = filtered,
             )
         }
     }
@@ -346,14 +382,18 @@ object EngineClient {
             }
             val text = content.toString()
             if (text.isBlank()) throw EmptyResponseException()
+            val truncatedByLength = finishReason == ChatCompletionChunk.Choice.FinishReason.LENGTH
+            val filtered = finishReason == ChatCompletionChunk.Choice.FinishReason.CONTENT_FILTER
             return ToolCallResult.Content(
                 text,
                 incompleteReason(
-                    truncatedByLength = finishReason == ChatCompletionChunk.Choice.FinishReason.LENGTH,
-                    filtered = finishReason == ChatCompletionChunk.Choice.FinishReason.CONTENT_FILTER,
+                    truncatedByLength = truncatedByLength,
+                    filtered = filtered,
                     droppedChunks = droppedChunks,
                 ),
                 usage = usage,
+                truncatedByLength = truncatedByLength,
+                filtered = filtered,
             )
         }
     }

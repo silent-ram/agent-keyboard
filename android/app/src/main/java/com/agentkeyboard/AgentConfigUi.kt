@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
@@ -18,6 +19,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -25,7 +27,10 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -33,6 +38,7 @@ import androidx.compose.material3.MaterialTheme
 import com.agentkeyboard.agent.AgentProfileStore
 import com.agentkeyboard.agent.ProfileSaveResult
 import com.agentkeyboard.agent.AgentFactory
+import com.agentkeyboard.agent.RunDiagnostics
 import com.agentkeyboard.tools.ToolIds
 import kotlinx.coroutines.CancellationException
 import androidx.compose.ui.unit.dp
@@ -78,6 +84,46 @@ fun AgentConfigScreen(
         MemorySection(settingsRepository)
         HorizontalDivider(color = AppTheme.colors.lineGray)
         UserMdSection(settingsRepository)
+        HorizontalDivider(color = AppTheme.colors.lineGray)
+        DiagnosticsSection()
+    }
+}
+
+/**
+ * 运行诊断:最近若干次运行的结果、耗时与用量(进程内,不落盘)。
+ * 输入法面板和 App 的运行都在同一进程,这里的记录两边都能看到。
+ */
+@Composable
+private fun DiagnosticsSection() {
+    val records by RunDiagnostics.recent.collectAsState()
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            SectionTitle(stringResource(R.string.diag_section))
+            Spacer(Modifier.weight(1f))
+            if (records.isNotEmpty()) {
+                TextButton(
+                    onClick = {
+                        clipboard.setText(AnnotatedString(records.joinToString("\n") { RunDiagnostics.line(it) }))
+                        android.widget.Toast.makeText(context, R.string.diag_copied, android.widget.Toast.LENGTH_SHORT).show()
+                    },
+                ) { Text(stringResource(R.string.diag_copy), color = PrimaryBlue) }
+                TextButton(onClick = RunDiagnostics::clear) { Text(stringResource(R.string.diag_clear), color = MutedText) }
+            }
+        }
+        Text(stringResource(R.string.diag_note), color = MutedText, fontSize = 12.sp)
+        if (records.isEmpty()) {
+            Text(stringResource(R.string.diag_empty), color = MutedText, fontSize = 13.sp)
+        }
+        records.forEach { record ->
+            Text(
+                remember(record) { RunDiagnostics.line(record) },
+                color = if (record.outcome == "FAILED") ErrorText else BodyText,
+                fontSize = 12.sp,
+                lineHeight = 17.sp,
+            )
+        }
     }
 }
 

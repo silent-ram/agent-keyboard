@@ -1,12 +1,15 @@
 package com.agentkeyboard.ime.panel
 
+import com.agentkeyboard.agent.AgentError
 import com.agentkeyboard.agent.AgentEvent
 import com.agentkeyboard.agent.AgentRunSummary
 import com.agentkeyboard.agent.ConfirmationKind
 import com.agentkeyboard.agent.ConfirmationRequest
+import com.agentkeyboard.agent.RunDiagnostics
 import com.agentkeyboard.data.db.AgentMessageEntity
 import com.agentkeyboard.tools.Citation
 import com.agentkeyboard.tools.CitationJson
+import com.agentkeyboard.tools.TOOL_USER_DENIED
 import com.agentkeyboard.tools.ToolIds
 
 /** 工具卡片四态(12 号设计 §3) */
@@ -54,19 +57,40 @@ sealed interface PanelMessage {
         /** Result may only be inserted into the input session that requested it. */
         val editorGeneration: Long? = null,
         val editorSelection: EditorSelectionSnapshot? = null,
+        /** 重试期间保留的流式草稿(灰显);重试结果的第一个增量会清掉 */
+        val retrying: Boolean = false,
+        /** 预算耗尽后由无工具收尾请求给出的答案:卡片标注「基于部分信息」 */
+        val partial: Boolean = false,
     ) : PanelMessage {
         val canInsert: Boolean
             get() = !readonly && !streaming && editorGeneration != null && text.isNotBlank()
     }
 
-    /** 错误卡:[kind] = AgentError.kind(BAD_KEY 附去设置;NOT_CONFIGURED 跳 S9) */
-    data class Error(val kind: String, val message: String) : PanelMessage
+    /**
+     * 错误卡:[kind] = AgentError.kind(BAD_KEY 附去设置;NOT_CONFIGURED 跳 S9)。
+     * [diagnostics] = 调试信息(分类、状态码、耗时与计数,不含对话内容),[retryable] = 显示「重试」。
+     */
+    data class Error(
+        val kind: String,
+        val message: String,
+        val diagnostics: String? = null,
+        val retryable: Boolean = false,
+    ) : PanelMessage
 
     data class System(val text: String) : PanelMessage
+
+    /** 网络不稳、模型调用将重试的瞬时提示行(还没有草稿可显示时占位;后续事件到达即移除) */
+    data object RetryNotice : PanelMessage
 }
+
+/** 运行阶段:运行条的状态文字按它取,而不是恒定的「运行中」 */
+enum class RunPhase { THINKING, KNOWLEDGE_SEARCH, WEB_SEARCH, TOOL, ANSWER, RETRYING }
 
 /** 出网工具集合(预览卡"未验证"判定) */
 val OUTBOUND_TOOL_IDS = setOf(ToolIds.WEB_SEARCH, ToolIds.FETCH_PAGE)
+
+/** 重试可能成功的错误分类(错误卡显示「重试」) */
+val RETRYABLE_ERROR_KINDS = setOf("TIMEOUT", "NO_NETWORK", "RATE_LIMIT", "OTHER", "CONTEXT_LENGTH")
 
 /**
  * 「总是允许」撤销条状态(P1-1,状态提升):
@@ -110,6 +134,10 @@ fun toolLabel(toolId: String): String = when (toolId) {
 
 object PanelReducer {
 
+    /** 运行期的瞬时占位(加载行 / 重试提示):任何后续事件都先清掉 */
+    private fun List<PanelMessage>.withoutTransient(): List<PanelMessage> =
+        filterNot { it == PanelMessage.Loading || it is PanelMessage.RetryNotice }
+
     /** 完成卡摘要行(12 号设计 §3 摘要文案示例) */
     fun doneSummary(toolId: String, raw: String, citationCount: Int): String = when (toolId) {
         ToolIds.WEB_SEARCH -> "命中 $citationCount 条来源"
@@ -126,11 +154,11 @@ object PanelReducer {
 
     /** LLM 思考中:清旧占位 → Loading */
     fun onThinking(messages: List<PanelMessage>): List<PanelMessage> =
-        messages.filterNot { it == PanelMessage.Loading } + PanelMessage.Loading
+        messages.withoutTransient() + PanelMessage.Loading
 
     /** 工具开始:Loading 移除;同 id 卡排队中则转运行,否则追加运行卡 */
     fun onStepStarted(messages: List<PanelMessage>, toolCallId: String, toolId: String): List<PanelMessage> {
-        val base = messages.filterNot { it == PanelMessage.Loading }
+        val base = messages.withoutTransient()
         val idx = base.indexOfFirst { it is PanelMessage.ToolCard && it.toolCallId == toolCallId }
         return if (idx >= 0) {
             base.mapIndexed { i, m ->
@@ -139,6 +167,13 @@ object PanelReducer {
         } else {
             base + PanelMessage.ToolCard(toolCallId, toolId, toolLabel(toolId), ToolCardState.RUNNING, "执行中…")
         }
+    }
+
+    /** 工具失败时卡片上的说明:被拒绝、没轮到执行与真正的执行失败分开说 */
+    internal fun failedToolSummary(raw: String): String = when {
+        raw == TOOL_USER_DENIED -> "已拒绝"
+        raw.endsWith("未执行") -> "未执行"
+        else -> "执行失败"
     }
 
     /** 工具结束:同 id 卡转完成/失败;命中注入警示时附警示文案(FR-E4) */
@@ -157,10 +192,31 @@ object PanelReducer {
             toolId = toolId,
             label = toolLabel(toolId),
             state = if (ok) ToolCardState.DONE else ToolCardState.FAILED,
-            summary = if (ok) doneSummary(toolId, raw, citationCount) else "执行失败",
+            summary = if (ok) doneSummary(toolId, raw, citationCount) else failedToolSummary(raw),
             flagged = flagged,
         )
         return if (idx >= 0) messages.mapIndexed { i, m -> if (i == idx) card else m } else messages + card
+    }
+
+    /**
+     * 运行阶段:按消息流里最近的状态推断(不另存状态)。
+     * 重试优先;其次是最近的运行中工具卡(检索/搜索各有文字)与流式草稿;都没有 = 模型思考中。
+     */
+    fun runPhase(messages: List<PanelMessage>): RunPhase {
+        if (messages.any { it is PanelMessage.RetryNotice || it is PanelMessage.Result && it.retrying }) {
+            return RunPhase.RETRYING
+        }
+        for (m in messages.asReversed()) {
+            when {
+                m is PanelMessage.ToolCard && m.state == ToolCardState.RUNNING -> return when (m.toolId) {
+                    ToolIds.KB_SEARCH -> RunPhase.KNOWLEDGE_SEARCH
+                    ToolIds.WEB_SEARCH -> RunPhase.WEB_SEARCH
+                    else -> RunPhase.TOOL
+                }
+                m is PanelMessage.Result && m.streaming -> return RunPhase.ANSWER
+            }
+        }
+        return RunPhase.THINKING
     }
 
     /**
@@ -183,7 +239,7 @@ object PanelReducer {
         summary: AgentRunSummary = AgentRunSummary.EMPTY,
     ): List<PanelMessage> {
         // 流式卡(P1-3 同型):Finished 用正式卡替换,避免重复
-        val base = messages.filterNot { it == PanelMessage.Loading }
+        val base = messages.withoutTransient()
             .filterNot { it is PanelMessage.Result && it.streaming }
         val hadOutbound = hasOutboundCalls(base)
         val meta = buildString {
@@ -201,8 +257,8 @@ object PanelReducer {
                 append(" tokens")
             }
             elapsedSeconds?.let { append(" · ${it}s") }
-            val toolSteps = summary.steps.count { it.kind != "llm" }
-            if (toolSteps > 0) append(" · ${toolSteps} 次工具调用")
+            // 没有执行过的调用(名称无效、被跳过)、重试、上下文收紧与模型复核都不是工具调用,不计入
+            if (summary.toolCalls > 0) append(" · ${summary.toolCalls} 次工具调用")
         }
         return base + PanelMessage.Result(
             text = content,
@@ -216,6 +272,7 @@ object PanelReducer {
             fromSelection = fromSelection,
             editorGeneration = editorGeneration,
             editorSelection = editorSelection,
+            partial = summary.partial,
         )
     }
 
@@ -234,7 +291,7 @@ object PanelReducer {
             if (citations.isNotEmpty()) "已获得部分资料，任务未完成。" else ""
         }
         val base = if (visibleContent.isBlank()) {
-            messages.filterNot { it == PanelMessage.Loading }
+            messages.withoutTransient()
         } else {
             val hasAnswer = content.isNotBlank()
             val completed = onFinished(
@@ -252,12 +309,12 @@ object PanelReducer {
         return base + PanelMessage.System("未完成：$reason")
     }
 
-    /** 流式增量(M1-T6):更新最后一张流式卡,否则新建;Loading 移除 */
+    /** 流式增量(M1-T6):更新最后一张流式卡,否则新建;Loading 移除;重试状态解除 */
     fun onContentDelta(messages: List<PanelMessage>, accumulated: String, modelLabel: String?): List<PanelMessage> {
-        val base = messages.filterNot { it == PanelMessage.Loading }
+        val base = messages.withoutTransient()
         val last = base.lastOrNull()
         return if (last is PanelMessage.Result && last.streaming) {
-            base.dropLast(1) + last.copy(text = accumulated)
+            base.dropLast(1) + last.copy(text = accumulated, retrying = false)
         } else {
             base + PanelMessage.Result(
                 text = accumulated,
@@ -268,19 +325,56 @@ object PanelReducer {
     }
 
     /**
+     * 模型调用将重试(网络不稳):已上屏的草稿保留并灰显,由重试结果的第一个增量整体替换;
+     * 还没有草稿时用提示行占位。提示是瞬时的,任何后续事件都会清掉。
+     */
+    fun onRetrying(messages: List<PanelMessage>): List<PanelMessage> {
+        val base = messages.withoutTransient()
+        val last = base.lastOrNull()
+        return if (last is PanelMessage.Result && last.streaming) {
+            base.dropLast(1) + last.copy(retrying = true)
+        } else {
+            base + PanelMessage.RetryNotice
+        }
+    }
+
+    /**
      * 撤回流式草稿(安全兜底):去掉所有草稿卡。草稿从不进入编辑器,
      * 撤回后由随后的 Finished/Incomplete 提供唯一可信结果。
      */
     fun onContentReset(messages: List<PanelMessage>): List<PanelMessage> =
-        messages.filterNot { it is PanelMessage.Result && it.streaming }
+        messages.withoutTransient().filterNot { it is PanelMessage.Result && it.streaming }
 
-    /** 失败 → 错误卡(Loading 移除) */
-    fun onFailed(messages: List<PanelMessage>, kind: String, message: String): List<PanelMessage> =
-        messages.filterNot { it == PanelMessage.Loading } + PanelMessage.Error(kind, message)
+    /** 运行已结束:还在转的工具卡不能一直停在「执行中」 */
+    private fun settleRunningCards(messages: List<PanelMessage>, summary: String): List<PanelMessage> =
+        messages.map { m ->
+            if (m is PanelMessage.ToolCard && m.state == ToolCardState.RUNNING) m.copy(state = ToolCardState.FAILED, summary = summary) else m
+        }
+
+    /**
+     * 失败 → 错误卡(Loading 移除)。[diagnostics] 来自运行摘要:只有分类、状态码与计数,
+     * 直接显示并可复制;错误卡因此能说清「哪一步、什么状态码、花了多久」。
+     */
+    fun onFailed(
+        messages: List<PanelMessage>,
+        kind: String,
+        message: String,
+        diagnostics: String? = null,
+        retryable: Boolean = kind in RETRYABLE_ERROR_KINDS,
+    ): List<PanelMessage> =
+        settleRunningCards(messages.withoutTransient(), "未完成") +
+            PanelMessage.Error(kind, message, diagnostics?.takeIf { it.isNotBlank() }, retryable)
+
+    fun onFailed(
+        messages: List<PanelMessage>,
+        error: AgentError,
+        summary: AgentRunSummary = AgentRunSummary.EMPTY,
+    ): List<PanelMessage> =
+        onFailed(messages, error.kind, error.message, RunDiagnostics.describe(error, summary))
 
     /** 停止 → 系统注记(已生成部分保留) */
     fun onStopped(messages: List<PanelMessage>): List<PanelMessage> =
-        messages.filterNot { it == PanelMessage.Loading } + PanelMessage.System("已停止(内容不完整)")
+        settleRunningCards(messages.withoutTransient(), "已停止") + PanelMessage.System("已停止(内容不完整)")
 
     /** 确认请求到达(事件/单槽恢复):消息流不动,确认条由独立状态渲染 */
     fun onConfirmationRequired(messages: List<PanelMessage>): List<PanelMessage> = messages
@@ -327,7 +421,7 @@ object PanelReducer {
                         toolId = toolId,
                         label = toolLabel(toolId),
                         state = if (ok) ToolCardState.DONE else ToolCardState.FAILED,
-                        summary = if (ok) doneSummary(toolId, "", 0) else "执行失败",
+                        summary = if (ok) doneSummary(toolId, "", 0) else failedToolSummary(row.content),
                         flagged = meta?.optBoolean("flagged", false) ?: false,
                     )
                 }
@@ -351,26 +445,30 @@ object PanelReducer {
     }
 
     /** AgentEvent 应用(面板事件收集循环统一入口;返回新消息列表) */
-    fun apply(messages: List<PanelMessage>, event: AgentEvent, modelLabel: String?, elapsedSeconds: Long?): List<PanelMessage> =
-        when (event) {
-            is AgentEvent.Thinking -> onThinking(messages)
-            is AgentEvent.StepStarted -> onStepStarted(messages, event.call.toolCallId, event.call.toolId)
+    fun apply(messages: List<PanelMessage>, event: AgentEvent, modelLabel: String?, elapsedSeconds: Long?): List<PanelMessage> {
+        // 重试提示是瞬时的:重试之后的第一个事件到来即消失(连续重试时由 Retrying 分支重新给出)
+        val base = messages.withoutTransient()
+        return when (event) {
+            is AgentEvent.Thinking -> onThinking(base)
+            is AgentEvent.StepStarted -> onStepStarted(base, event.call.toolCallId, event.call.toolId)
             is AgentEvent.StepFinished -> onStepFinished(
-                messages, event.call.toolCallId, event.call.toolId,
+                base, event.call.toolCallId, event.call.toolId,
                 ok = event.result.ok, raw = event.result.raw,
                 citationCount = event.result.citations.size, flagged = event.flagged,
             )
-            is AgentEvent.ContentDelta -> onContentDelta(messages, event.accumulated, modelLabel)
-            is AgentEvent.ContentReset -> onContentReset(messages)
+            is AgentEvent.ContentDelta -> onContentDelta(base, event.accumulated, modelLabel)
+            is AgentEvent.ContentReset -> onContentReset(base)
+            is AgentEvent.Retrying -> onRetrying(base)
             is AgentEvent.Finished -> onFinished(
-                messages, event.content, event.citations, modelLabel, elapsedSeconds, summary = event.summary,
+                base, event.content, event.citations, modelLabel, elapsedSeconds, summary = event.summary,
             )
             is AgentEvent.Incomplete -> onIncomplete(
-                messages, event.content, event.citations, modelLabel, elapsedSeconds, event.reason,
+                base, event.content, event.citations, modelLabel, elapsedSeconds, event.reason,
                 summary = event.summary,
             )
-            is AgentEvent.Failed -> onFailed(messages, event.error.kind, event.error.message)
-            is AgentEvent.Stopped -> onStopped(messages)
-            is AgentEvent.Started, is AgentEvent.ConfirmationRequired -> onConfirmationRequired(messages)
+            is AgentEvent.Failed -> onFailed(base, event.error, event.summary)
+            is AgentEvent.Stopped -> onStopped(base)
+            is AgentEvent.Started, is AgentEvent.ConfirmationRequired -> onConfirmationRequired(base)
         }
+    }
 }

@@ -33,6 +33,27 @@ class ToolContractTest {
         assertTrue(error.getBoolean("retryable"))
         assertEquals("服务超时", error.getString("message"))
         assertEquals("服务超时", r.raw) // raw 保持展示文案不变
+        // 方案 5.2:错误回喂带下一步建议(模型按错误码拿到默认提示,展示文案不变)
+        assertTrue(error.getString("hint").isNotBlank())
+        assertEquals(error.getString("hint"), r.hint)
+        assertTrue("可重试的错误建议里允许再试一次", error.getString("hint").contains("重试一次"))
+    }
+
+    @Test
+    fun `error结果 - 自定义hint覆盖默认建议`() {
+        val r = ToolResult.error("服务超时", ToolErrorCodes.TIMEOUT, retryable = true, hint = "换个关键词")
+        val inner = r.wrapped.removePrefix(ToolResultWrapper.OPEN).removeSuffix(ToolResultWrapper.CLOSE).trim()
+        assertEquals("换个关键词", JSONObject(inner).getJSONObject("error").getString("hint"))
+        assertEquals("换个关键词", r.hint)
+    }
+
+    @Test
+    fun `error结果 - 用户拒绝与不存在的工具各有明确建议`() {
+        val denied = ToolResult.error("用户拒绝了这次请求", ToolErrorCodes.USER_DENIED)
+        assertTrue(denied.hint!!.contains("不要"))
+        val missing = ToolResult.error("此工具未注册", ToolErrorCodes.NOT_FOUND)
+        assertTrue(missing.hint!!.contains("不要再次调用"))
+        assertFalse(missing.retryable)
     }
 
     @Test
@@ -84,6 +105,8 @@ class ToolContractTest {
         assertEquals(ToolErrorCodes.NOT_CONFIGURED, unconfigured.execute("""{"query":"q"}""").errorCode)
     }
 
+    // 拒绝/询问流程用仍需授权的 fetch_page:web_search / kb_search 已默认可用,不再弹授权询问
+
     @Test
     fun `registry - 用户拒绝映射USER_DENIED且raw保持协议值`() = runBlocking {
         val gate = PermissionGate(
@@ -91,16 +114,42 @@ class ToolContractTest {
             ConfirmationResolver { req -> req.kind == com.agentkeyboard.agent.ConfirmationKind.LLM_DISCLOSURE },
         )
         val registry = AgentToolRegistry(
-            tools = listOf(WebSearchTool(apiKeyProvider = { "k" }, transport = StubTransport(200, """{"results":[]}"""))),
+            tools = listOf(FetchPageTool(transport = StubTransport(200, "body"))),
             gate = gate, activityLogDao = FakeActivityLogDao(),
         )
         val r = registry.execute(
-            ToolCall("c1", "web_search", """{"query":"q"}"""),
+            ToolCall("c1", "fetch_page", """{"url":"https://a.example/"}"""),
             TaintSnapshot(null, null), sessionId = null,
         )
         assertEquals(TOOL_USER_DENIED, r.raw) // Runtime 终态判定依赖的协议值不变
         assertEquals(ToolErrorCodes.USER_DENIED, r.errorCode)
         assertFalse(r.retryable)
+        // 模型看到的不是裸的 user_denied:带错误码与「不要再试」的建议
+        val inner = r.wrapped.removePrefix(ToolResultWrapper.OPEN).removeSuffix(ToolResultWrapper.CLOSE).trim()
+        val error = JSONObject(inner).getJSONObject("error")
+        assertEquals("USER_DENIED", error.getString("code"))
+        assertTrue(error.getString("hint").contains("不要"))
+    }
+
+    @Test
+    fun `registry - web_search 默认放行不弹授权询问`() = runBlocking {
+        var confirmations = 0
+        val logs = FakeActivityLogDao()
+        // resolver 一律拒绝:只要弹了询问,web_search 就不会执行
+        val gate = PermissionGate(FakePermissionStateDao(), logs, ConfirmationResolver { confirmations++; false })
+        val registry = AgentToolRegistry(
+            tools = listOf(
+                WebSearchTool(
+                    apiKeyProvider = { "k" },
+                    transport = StubTransport(200, """{"results":[{"title":"t","url":"https://example.com","content":"c"}]}"""),
+                ),
+            ),
+            gate = gate, activityLogDao = FakeActivityLogDao(),
+        )
+        val r = registry.execute(ToolCall("c1", "web_search", """{"query":"q"}"""), TaintSnapshot(null, null), sessionId = null)
+        assertTrue(r.ok)
+        assertEquals(0, confirmations)
+        assertEquals(listOf(com.agentkeyboard.data.db.LogOutcomes.AUTO_ALLOW), logs.entries.map { it.outcome })
     }
 
     @Test
@@ -108,10 +157,10 @@ class ToolContractTest {
         var confirmations = 0
         val gate = PermissionGate(FakePermissionStateDao(), FakeActivityLogDao(), ConfirmationResolver { confirmations++; true })
         val registry = AgentToolRegistry(
-            tools = listOf(WebSearchTool(apiKeyProvider = { "k" }, transport = StubTransport(200, """{"results":[]}"""))),
+            tools = listOf(FetchPageTool(transport = StubTransport(200, "body"))),
             gate = gate, activityLogDao = FakeActivityLogDao(),
         )
-        val r = registry.execute(ToolCall("c1", "web_search", "not json"), TaintSnapshot(null, null), sessionId = null)
+        val r = registry.execute(ToolCall("c1", "fetch_page", "not json"), TaintSnapshot(null, null), sessionId = null)
         assertFalse(r.ok)
         assertEquals(ToolErrorCodes.BAD_PARAMS, r.errorCode)
         assertEquals(0, confirmations)
@@ -137,10 +186,11 @@ class ToolContractTest {
     }
 
     @Test
-    fun `registry - 未知工具映射DISABLED`() = runBlocking {
+    fun `registry - 未知工具映射NOT_FOUND且不回显工具名`() = runBlocking {
         val gate = PermissionGate(FakePermissionStateDao(), FakeActivityLogDao(), ConfirmationResolver { true })
         val registry = AgentToolRegistry(emptyList(), gate, FakeActivityLogDao())
         val r = registry.execute(ToolCall("c1", "ghost_tool", "{}"), TaintSnapshot(null, null), null)
-        assertEquals(ToolErrorCodes.DISABLED, r.errorCode)
+        assertEquals(ToolErrorCodes.NOT_FOUND, r.errorCode)
+        assertFalse("模型给的名称不回显进回喂", r.raw.contains("ghost_tool"))
     }
 }

@@ -22,6 +22,7 @@ import java.util.concurrent.atomic.AtomicInteger
 /**
  * 权限门控状态机(11-权限设计 §3/§4/§5,FR-E1/E2/E6):
  * UNASKED→本次允许→ASK_EVERY_TIME;→总是允许→ALWAYS_ALLOW;底线不可豁免;llm_call 首次明示。
+ * kb_search / web_search 默认可用,不弹授权询问(见 PermissionGate.DEFAULT_ALLOWED_TOOLS)。
  */
 class PermissionGateTest {
     @Test
@@ -41,18 +42,67 @@ class PermissionGateTest {
     }
 
     @Test
-    fun `each knowledge request requires consent even after an old permanent approval`() = runBlocking {
+    fun `kb and web search run without confirmation whatever the stored permission is`() = runBlocking {
+        val states = FakePermissionStateDao()
         val requests = mutableListOf<ConfirmationRequest>()
-        val gate = PermissionGate(FakePermissionStateDao(), FakeActivityLogDao(), ConfirmationResolver {
+        val logs = FakeActivityLogDao()
+        val gate = PermissionGate(states, logs, ConfirmationResolver {
             requests += it
             true
         })
-        gate.setAlwaysAllow("kb_search")
-        repeat(2) {
-            assertTrue(gate.gate("kb_search", "sample question", "", TaintSnapshot.EMPTY, 1) is GateResult.Allowed)
+        // 以前点过「本次允许/拒绝」留下的 ASK_EVERY_TIME 记录也不再触发询问
+        states.upsert(com.agentkeyboard.data.db.PermissionStateEntity("kb_search", PermissionStates.ASK_EVERY_TIME, 0))
+        states.upsert(com.agentkeyboard.data.db.PermissionStateEntity("web_search", PermissionStates.ASK_EVERY_TIME, 0))
+        listOf("kb_search", "web_search").forEach { tool ->
+            gate.beginTask() // 每次都当新任务:旧的"每个任务问一次"也不再生效
+            repeat(2) {
+                val r = gate.gate(tool, "sample question", "", TaintSnapshot.EMPTY, 1)
+                assertTrue(r is GateResult.Allowed)
+                assertEquals(com.agentkeyboard.data.db.LogOutcomes.AUTO_ALLOW, (r as GateResult.Allowed).outcome)
+            }
         }
-        assertEquals(2, requests.size)
-        assertTrue(requests.none { it.canRemember })
+        assertTrue("默认可用:不弹任何确认条", requests.isEmpty())
+        // 每次调用仍逐条记录活动日志
+        assertEquals(4, logs.entries.size)
+        assertTrue(logs.entries.all { it.preview.isEmpty() })
+    }
+
+    @Test
+    fun `kb search still asks on the spot when the query carries the user's own text`() = runBlocking {
+        val requests = mutableListOf<ConfirmationRequest>()
+        val g = gate(ConfirmationResolver { true }, confirmations = requests)
+        val r = g.gate("kb_search", "订单3852156789投诉 怎么处理", "", clipTaint, 1L)
+        assertTrue(r is GateResult.Allowed)
+        assertEquals(ConfirmationKind.DERIVED_BOTTOM_LINE, requests.single().kind)
+        assertFalse("派生确认不能记成总是允许", requests.single().canRemember)
+        assertEquals(UserContentFlags.CLIPBOARD, (r as GateResult.Allowed).containsUserContent)
+    }
+
+    /** 运行时据此决定调用能否与同批调用并发:与 gate() 是否弹条同口径,只读、不落日志 */
+    @Test
+    fun `mayPrompt mirrors whether gate would ask`() = runBlocking {
+        val states = FakePermissionStateDao()
+        val logs = FakeActivityLogDao()
+        val gate = gate(ConfirmationResolver { true }, states = states, logs = logs)
+        // 默认可用的检索与搜索:载荷不含用户原文就不弹
+        assertFalse(gate.mayPrompt("kb_search", "内部流程", TaintSnapshot.EMPTY))
+        assertFalse(gate.mayPrompt("web_search", "public topic", TaintSnapshot.EMPTY))
+        // 派生底线逐次判定、不可豁免
+        assertTrue(gate.mayPrompt("kb_search", "订单3852156789投诉 怎么处理", clipTaint))
+        // 还没授权过的出网工具会弹确认条
+        assertTrue(gate.mayPrompt("fetch_page", "https://a.example/", TaintSnapshot.EMPTY))
+        states.upsert(com.agentkeyboard.data.db.PermissionStateEntity("fetch_page", PermissionStates.ALWAYS_ALLOW, 0))
+        assertFalse("总是允许后只剩派生判定", gate.mayPrompt("fetch_page", "https://a.example/", TaintSnapshot.EMPTY))
+
+        // 任务内点过「本次允许」的同工具不再弹
+        states.upsert(com.agentkeyboard.data.db.PermissionStateEntity("mcp_x", PermissionStates.ASK_EVERY_TIME, 0))
+        assertTrue(gate.mayPrompt("mcp_x", "args", TaintSnapshot.EMPTY))
+        gate.beginTask()
+        assertTrue(gate.gate("mcp_x", "args", "", TaintSnapshot.EMPTY, 1L) is GateResult.Allowed)
+        assertFalse(gate.mayPrompt("mcp_x", "args", TaintSnapshot.EMPTY))
+
+        // mayPrompt 只读:只有 gate() 那一次调用留下日志
+        assertEquals(1, logs.entries.size)
     }
 
 
@@ -90,23 +140,25 @@ class PermissionGateTest {
         assertEquals("资料检索", logs.entries.single().target)
     }
 
+    // 以下授权状态机用例用 fetch_page:web_search 已默认可用,不再走询问流程
+
     @Test
     fun `UNASKED 首次确认 允许 - 落 ASK_EVERY_TIME 并放行`() = runBlocking {
         val states = FakePermissionStateDao()
         var decision = true
         val g = gate(ConfirmationResolver { decision }, states = states)
-        val r = g.gate("web_search", """{"query":"q4"}""", "搜索服务", TaintSnapshot.EMPTY, sessionId = 1L)
+        val r = g.gate("fetch_page", """{"url":"https://a.example/4"}""", "网页", TaintSnapshot.EMPTY, sessionId = 1L)
         assertTrue(r is GateResult.Allowed)
-        assertEquals(PermissionStates.ASK_EVERY_TIME, states.byTool("web_search")?.state)
+        assertEquals(PermissionStates.ASK_EVERY_TIME, states.byTool("fetch_page")?.state)
     }
 
     @Test
     fun `UNASKED 首次确认 拒绝 - 也落 ASK_EVERY_TIME 且 Denied`() = runBlocking {
         val states = FakePermissionStateDao()
         val g = gate(ConfirmationResolver { false }, states = states)
-        val r = g.gate("web_search", """{"query":"q"}""", "搜索服务", TaintSnapshot.EMPTY, 1L)
+        val r = g.gate("fetch_page", """{"url":"https://a.example/"}""", "网页", TaintSnapshot.EMPTY, 1L)
         assertEquals(GateResult.Denied, r)
-        assertEquals(PermissionStates.ASK_EVERY_TIME, states.byTool("web_search")?.state)
+        assertEquals(PermissionStates.ASK_EVERY_TIME, states.byTool("fetch_page")?.state)
     }
 
     @Test
@@ -117,12 +169,12 @@ class PermissionGateTest {
             asked.incrementAndGet(); true
         }, states = states)
         // 第一次:首次询问
-        g.gate("web_search", """{"query":"a"}""", "搜索服务", TaintSnapshot.EMPTY, 1L)
+        g.gate("fetch_page", """{"url":"https://a.example/"}""", "网页", TaintSnapshot.EMPTY, 1L)
         assertEquals(1, asked.get())
         // 记忆「总是允许」(UI 组合动作)
-        g.setAlwaysAllow("web_search")
+        g.setAlwaysAllow("fetch_page")
         g.beginTask() // 新任务:任务级"本次允许"缓存失效,走 ALWAYS_ALLOW 分支
-        val r = g.gate("web_search", """{"query":"改写后的关键词"}""", "搜索服务", TaintSnapshot.EMPTY, 1L)
+        val r = g.gate("fetch_page", """{"url":"https://b.example/"}""", "网页", TaintSnapshot.EMPTY, 1L)
         assertTrue(r is GateResult.Allowed)
         assertEquals(GateResult.Allowed::class.simpleName, (r as GateResult.Allowed)::class.simpleName)
         assertEquals(com.agentkeyboard.data.db.LogOutcomes.AUTO_ALLOW, r.outcome)
@@ -134,8 +186,8 @@ class PermissionGateTest {
         val asked = AtomicInteger()
         val g = gate(ConfirmationResolver { asked.incrementAndGet(); true })
         g.beginTask()
-        g.gate("web_search", """{"query":"a"}""", "搜索服务", TaintSnapshot.EMPTY, 1L)
-        g.gate("web_search", """{"query":"b"}""", "搜索服务", TaintSnapshot.EMPTY, 1L)
+        g.gate("fetch_page", """{"url":"https://a.example/"}""", "网页", TaintSnapshot.EMPTY, 1L)
+        g.gate("fetch_page", """{"url":"https://b.example/"}""", "网页", TaintSnapshot.EMPTY, 1L)
         assertEquals(1, asked.get())
     }
 
@@ -257,11 +309,23 @@ class PermissionGateTest {
         val states = FakePermissionStateDao()
         val asked = AtomicInteger()
         val g = gate(ConfirmationResolver { asked.incrementAndGet(); true }, states = states)
-        g.setAlwaysAllow("web_search")
-        g.reset("web_search")
-        assertEquals(PermissionStates.UNASKED, states.byTool("web_search")?.state)
-        g.gate("web_search", """{"query":"x"}""", "搜索服务", TaintSnapshot.EMPTY, 1L)
+        g.setAlwaysAllow("fetch_page")
+        g.reset("fetch_page")
+        assertEquals(PermissionStates.UNASKED, states.byTool("fetch_page")?.state)
+        g.gate("fetch_page", """{"url":"https://a.example/x"}""", "网页", TaintSnapshot.EMPTY, 1L)
         assertEquals(1, asked.get())
+    }
+
+    @Test
+    fun `重置授权 - kb 与 web 仍然默认可用`() = runBlocking {
+        val states = FakePermissionStateDao()
+        val asked = AtomicInteger()
+        val g = gate(ConfirmationResolver { asked.incrementAndGet(); true }, states = states)
+        g.reset("web_search")
+        g.reset("kb_search")
+        assertTrue(g.gate("web_search", "query", "搜索服务", TaintSnapshot.EMPTY, 1L) is GateResult.Allowed)
+        assertTrue(g.gate("kb_search", "query", "资料检索", TaintSnapshot.EMPTY, 1L) is GateResult.Allowed)
+        assertEquals(0, asked.get())
     }
 
     @Test
@@ -283,7 +347,7 @@ class PermissionGateTest {
             emitConfirmation = { }, // 故意不收集:模拟面板未订阅 events
         )
         val job = launch {
-            gate.gate("web_search", """{"query":"q"}""", "搜索服务", TaintSnapshot.EMPTY, 1L)
+            gate.gate("fetch_page", """{"url":"https://a.example/"}""", "网页", TaintSnapshot.EMPTY, 1L)
         }
         delay(200)
         // 不订阅 events:直接读单槽 StateFlow 可恢复确认条
@@ -313,13 +377,13 @@ class PermissionGateTest {
             emitConfirmation = { },
         )
         gateRef = gate
-        val r1 = gate.gate("web_search", """{"query":"a"}""", "搜索服务", TaintSnapshot.EMPTY, 1L)
+        val r1 = gate.gate("fetch_page", """{"url":"https://a.example/"}""", "网页", TaintSnapshot.EMPTY, 1L)
         assertTrue(r1 is GateResult.Allowed)
         // resolver 已落盘 ALWAYS_ALLOW → gate 不降级为 ASK_EVERY_TIME
-        assertEquals(PermissionStates.ALWAYS_ALLOW, states.byTool("web_search")?.state)
+        assertEquals(PermissionStates.ALWAYS_ALLOW, states.byTool("fetch_page")?.state)
         // 新任务:直接走 ALWAYS_ALLOW 自动放行(不再弹确认)
         gate.beginTask()
-        val r2 = gate.gate("web_search", """{"query":"改写关键词"}""", "搜索服务", TaintSnapshot.EMPTY, 2L)
+        val r2 = gate.gate("fetch_page", """{"url":"https://b.example/"}""", "网页", TaintSnapshot.EMPTY, 2L)
         assertTrue(r2 is GateResult.Allowed)
         assertEquals(com.agentkeyboard.data.db.LogOutcomes.AUTO_ALLOW, (r2 as GateResult.Allowed).outcome)
     }

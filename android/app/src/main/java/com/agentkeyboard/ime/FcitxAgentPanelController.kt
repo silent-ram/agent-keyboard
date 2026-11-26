@@ -19,6 +19,7 @@ import com.agentkeyboard.agent.ConfirmationRequest
 import com.agentkeyboard.agent.ConfirmationResolver
 import com.agentkeyboard.agent.ProfileSaveResult
 import com.agentkeyboard.agent.ProfileSuggestion
+import com.agentkeyboard.agent.RunDiagnostics
 import com.agentkeyboard.agent.TaskType
 import com.agentkeyboard.agent.knowledgeAskTask
 import com.agentkeyboard.data.SettingsRepository
@@ -33,6 +34,7 @@ import com.agentkeyboard.ime.panel.UndoAlwaysController
 import com.agentkeyboard.ime.panel.sessionToListItem
 import com.agentkeyboard.tools.ToolIds
 import com.agentkeyboard.ui.formatAnswerText
+import com.agentkeyboard.util.Logs
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -47,6 +49,8 @@ import org.fcitx.fcitx5.android.R
 import org.fcitx.fcitx5.android.input.FcitxInputMethodService
 import org.fcitx.fcitx5.android.input.cursor.CursorRange
 import java.util.concurrent.atomic.AtomicLong
+
+private const val TAG = "AgentPanel"
 
 /** Hosts the existing knowledge chat UI inside the active Fcitx input view. */
 internal class FcitxAgentPanelController(
@@ -76,6 +80,8 @@ internal class FcitxAgentPanelController(
     private var visible = false
     private var activeSessionId: Long? = null
     private var submittedQuestion: String? = null
+    /** 最近一次发给 Agent 的问题:错误卡「重试」用 */
+    private var lastQuestion: String? = null
     private var manageEditorBuffer: PanelInputBuffer? = null
     private var profileEditorBuffer: PanelInputBuffer? = null
     private var activeDecision: CompletableDeferred<ConfirmationDecision>? = null
@@ -272,6 +278,7 @@ internal class FcitxAgentPanelController(
             return
         }
         state.profileSuggestion = null
+        lastQuestion = text
         val targetGeneration = service.currentAgentEditorGeneration
         val selection = service.currentInputSelection
         requestGeneration = targetGeneration
@@ -374,6 +381,8 @@ internal class FcitxAgentPanelController(
                 submittedQuestion = null
                 replaceMessages(PanelReducer.apply(state.messages.toList(), event, state.modelLabel, null))
                 state.busy = false
+                // 失败原因进日志:只有分类、状态码与计数(RunDiagnostics.describe 不读异常原文)
+                Logs.w(TAG, "agent failed: ${RunDiagnostics.describe(event.error, event.summary)} session=${event.sessionId}")
             }
             is AgentEvent.Stopped -> {
                 submittedQuestion = null
@@ -552,6 +561,20 @@ internal class FcitxAgentPanelController(
         }
 
         override fun onOpenSettings() = openModelManage()
+
+        override fun onRetry() {
+            val question = lastQuestion ?: return
+            if (!visible || !state.canUseChatComposer || service.isAgentPanelBlocked() || state.busy) return
+            // 重试接替错误卡:先确认这次发送能成立,再移除错误卡,避免卡片没了、请求也没发出去
+            if (state.messages.lastOrNull() is PanelMessage.Error) state.messages.removeAt(state.messages.lastIndex)
+            sendToAgent(question)
+        }
+
+        override fun onCopyDiagnostics(text: String) {
+            val clipboard = service.getSystemService(ClipboardManager::class.java) ?: return
+            clipboard.setPrimaryClip(ClipData.newPlainText("agent_keyboard_diagnostics", text))
+            Toast.makeText(service, R.string.panel_copied_toast, Toast.LENGTH_SHORT).show()
+        }
 
         override fun onOpenProfile() = openProfile()
 

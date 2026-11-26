@@ -13,9 +13,10 @@ const val TOOL_USER_DENIED = "user_denied"
 /**
  * 工具注册表 + 执行门控点(02-架构 §2.2/§2.4):
  * - schema 暴露给 LLM(常驻注册,含占位 stub 保证 schema 稳定);
- * - execute:出网工具先过 PermissionGate → runCatching 执行(失败作为 error 结果回喂,不中断)
- *   → InjectionScanner 标记警示 → 每步结果由 engine 落盘;
- * - read_context/kb_search/ask_user 免授权不弹窗;insert_text 预览确认由面板层保证,工具层直接执行但记日志。
+ * - execute:出网工具先过 PermissionGate → runCatching 执行(失败作为 error 结果回喂,不中断);
+ *   资料是否隔离、每步结果落盘由 engine 决定(AgentContentSafety);
+ * - read_context/ask_user 免授权不弹窗;kb_search/web_search 默认直接放行、不弹授权询问(见 PermissionGate);
+ *   insert_text 预览确认由面板层保证,工具层直接执行但记日志。
  */
 class AgentToolRegistry(
     tools: List<Tool>,
@@ -51,7 +52,10 @@ class AgentToolRegistry(
 
     suspend fun execute(call: ToolCall, taint: TaintSnapshot, sessionId: Long?): ToolResult {
         val tool = get(call.toolId)
-            ?: return ToolResult.error("未知工具:${call.toolId}", ToolErrorCodes.DISABLED)
+            ?: return ToolResult.error(
+                "此工具未注册:只能使用本轮提供的工具",
+                ToolErrorCodes.NOT_FOUND,
+            )
 
         // 参数不是 JSON 对象时直接回喂 BAD_PARAMS:模型可据此修正;出网工具也不必先弹授权再失败
         if (!isJsonObjectOrBlank(call.argsJson)) {
@@ -102,7 +106,9 @@ class AgentToolRegistry(
             sessionId = sessionId,
         )
         if (gateResult is GateResult.Denied) {
-            return ToolResult.error(TOOL_USER_DENIED, ToolErrorCodes.USER_DENIED)
+            // raw 保持协议值 user_denied(运行时终态判定与界面都依赖它);回喂模型的是带建议的结构化错误
+            return ToolResult.error("用户拒绝了这次请求", ToolErrorCodes.USER_DENIED)
+                .copy(raw = TOOL_USER_DENIED)
         }
         val result = executeTool(tool, call)
         if (!result.ok) {

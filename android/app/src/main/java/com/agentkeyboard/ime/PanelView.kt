@@ -73,6 +73,7 @@ import com.agentkeyboard.ime.panel.ConfirmationDecision
 import com.agentkeyboard.ime.panel.HistoryDrawer
 import com.agentkeyboard.ime.panel.PanelMessage
 import com.agentkeyboard.ime.panel.PanelReducer
+import com.agentkeyboard.ime.panel.RunPhase
 import com.agentkeyboard.ime.panel.SessionListItem
 import com.agentkeyboard.ime.panel.ToolCardState
 import com.agentkeyboard.tools.InjectionScanner
@@ -186,6 +187,10 @@ interface PanelCallbacks {
     fun onCopy(text: String)
     fun onOpenSettings()
     fun onDismissCard(message: PanelMessage.Result)
+    /** 错误卡「重试」:用同一个问题再发一次 */
+    fun onRetry() {}
+    /** 错误卡「复制诊断信息」:只有分类、状态码与计数,可直接贴进问题反馈 */
+    fun onCopyDiagnostics(text: String) {}
     /** ■ 停止 = engine.cancel()(确认挂起中点停止即拒绝) */
     fun onStop()
     /** 确认条用户决定:服务侧组合「先 setAlwaysAllow 再 resolve(true)」契约 */
@@ -453,8 +458,9 @@ private fun AgentChatArea(state: PanelUiState, callbacks: PanelCallbacks) {
                 )
             }
         }
+        // 运行条:状态文字随阶段变化(思考 / 查找资料 / 联网搜索 / 整理答案 / 重试中)
         if (state.busy) {
-            RunBar()
+            RunBar(PanelReducer.runPhase(state.messages))
         }
         LazyColumn(
             state = listState,
@@ -475,9 +481,9 @@ private fun AgentChatArea(state: PanelUiState, callbacks: PanelCallbacks) {
     }
 }
 
-/** 运行条(脉冲点 + 当前状态 + ■ 停止,12 号设计 §7) */
+/** 运行条(脉冲点 + 当前阶段 + ■ 停止,12 号设计 §7);阶段文字由消息流推断,见 PanelReducer.runPhase */
 @Composable
-private fun RunBar() {
+private fun RunBar(phase: RunPhase) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -487,7 +493,20 @@ private fun RunBar() {
     ) {
         CircularProgressIndicator(color = PrimaryBlue, strokeWidth = 2.dp, modifier = Modifier.width(14.dp).height(14.dp))
         Spacer(Modifier.width(8.dp))
-        Text(stringResource(R.string.panel_running_hint), fontSize = 12.sp, color = MutedText)
+        Text(
+            stringResource(
+                when (phase) {
+                    RunPhase.THINKING -> R.string.panel_running_hint
+                    RunPhase.KNOWLEDGE_SEARCH -> R.string.panel_phase_knowledge
+                    RunPhase.WEB_SEARCH -> R.string.panel_phase_web
+                    RunPhase.TOOL -> R.string.panel_phase_tool
+                    RunPhase.ANSWER -> R.string.panel_phase_answer
+                    RunPhase.RETRYING -> R.string.panel_retrying_hint
+                },
+            ),
+            fontSize = 12.sp,
+            color = MutedText,
+        )
     }
 }
 
@@ -496,6 +515,7 @@ private fun MessageItem(message: PanelMessage, callbacks: PanelCallbacks) {
     when (message) {
         is PanelMessage.UserText -> UserBubble(message.text, message.actionTag)
         is PanelMessage.Loading -> LoadingRow()
+        is PanelMessage.RetryNotice -> LoadingRow(R.string.panel_retrying_hint)
         is PanelMessage.ToolCard -> ToolCard(message)
         is PanelMessage.Result -> ResultCard(message, callbacks)
         is PanelMessage.Error -> ErrorCard(message, callbacks)
@@ -536,14 +556,14 @@ private fun UserBubble(text: String, actionTag: String? = null) {
 }
 
 @Composable
-private fun LoadingRow() {
+private fun LoadingRow(text: Int = R.string.panel_loading) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         CircularProgressIndicator(color = PrimaryBlue, strokeWidth = 2.dp, modifier = Modifier.width(16.dp).height(16.dp))
         Spacer(modifier = Modifier.width(8.dp))
-        Text(stringResource(R.string.panel_loading), fontSize = 13.sp, color = MutedText)
+        Text(stringResource(text), fontSize = 13.sp, color = MutedText)
     }
 }
 
@@ -637,6 +657,8 @@ private fun ResultCard(message: PanelMessage.Result, callbacks: PanelCallbacks) 
     }
     // 替换卡原文折叠态(超 3 行折叠,点开全文)
     var oldCollapsed by remember { mutableStateOf(true) }
+    // 重试期间草稿保留但灰显,表示这段内容还没定稿
+    val answerColor = if (message.retrying) BodyText.copy(alpha = 0.55f) else BodyText
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -681,7 +703,7 @@ private fun ResultCard(message: PanelMessage.Result, callbacks: PanelCallbacks) 
                 Text(
                     answerText,
                     fontSize = 14.sp,
-                    color = BodyText,
+                    color = answerColor,
                 )
             }
         } else {
@@ -689,13 +711,22 @@ private fun ResultCard(message: PanelMessage.Result, callbacks: PanelCallbacks) 
                 Text(
                     answerText,
                     fontSize = 14.sp,
-                    color = BodyText,
+                    color = answerColor,
                 )
             }
         }
         if (message.streaming) {
             Spacer(modifier = Modifier.height(4.dp))
-            Text(stringResource(R.string.panel_streaming_hint), fontSize = 10.sp, color = MutedText)
+            Text(
+                stringResource(if (message.retrying) R.string.panel_retrying_hint else R.string.panel_streaming_hint),
+                fontSize = 10.sp,
+                color = MutedText,
+            )
+        }
+        // 预算耗尽后的收尾回答:资料不全,灰色小字标注
+        if (message.partial) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(stringResource(R.string.panel_partial_hint), fontSize = 10.sp, color = MutedText)
         }
         // 来源列表(📖 N;M4 出处强化:kb 来源显示「文档 §片段 · 片段首句」)
         if (message.citations.isNotEmpty()) {
@@ -755,14 +786,39 @@ private fun ResultCard(message: PanelMessage.Result, callbacks: PanelCallbacks) 
 
 // ==================== 错误卡 / 系统卡 ====================
 
-/** 错误卡(12 号设计 §8 五类成品文案;P3-8:文案由 kind→strings 单源,engine 不再携带文本) */
+/** 拦截原因文案:引擎给的稳定标识(AgentContentSafety 的原因码)→ strings;空或未知返回 null */
+internal fun unsafeReasonRes(reason: String): Int? = when (reason) {
+    com.agentkeyboard.agent.AgentContentSafety.TOO_LONG -> R.string.qa_unsafe_reason_too_long
+    com.agentkeyboard.agent.AgentContentSafety.GUARDRAIL -> R.string.qa_unsafe_reason_guardrail
+    com.agentkeyboard.agent.AgentContentSafety.SECRET -> R.string.qa_unsafe_reason_secret
+    com.agentkeyboard.agent.AgentContentSafety.INJECTION -> R.string.qa_unsafe_reason_injection
+    com.agentkeyboard.agent.AgentContentSafety.FORMAT -> R.string.qa_unsafe_reason_format
+    com.agentkeyboard.agent.AgentContentSafety.TOOL_CALL_ID -> R.string.qa_unsafe_reason_tool_call_id
+    else -> null
+}
+
+/**
+ * 错误卡(12 号设计 §8 五类成品文案;P3-8:文案由 kind→strings 单源,engine 不再携带文本)。
+ * 下方一行调试信息说明是哪类错误、什么状态码、花了多久,可复制进问题反馈;
+ * 可重试的错误给「重试」,配置类错误给「去设置」。
+ */
 @Composable
 private fun ErrorCard(message: PanelMessage.Error, callbacks: PanelCallbacks) {
     if (message.kind == "UNSAFE_INPUT" || message.kind == "UNSAFE_OUTPUT") {
-        Text(
-            stringResource(if (message.kind == "UNSAFE_INPUT") R.string.qa_unsafe_input else R.string.qa_unsafe_output),
-            color = ErrorText, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 12.dp),
-        )
+        // 多说一句是哪条客观条件不满足(超长/带出安全规则/含密钥…),再误拦时能直接对上规则
+        val reasonRes = unsafeReasonRes(message.message)
+        Column(modifier = Modifier.padding(horizontal = 12.dp)) {
+            Text(
+                stringResource(if (message.kind == "UNSAFE_INPUT") R.string.qa_unsafe_input else R.string.qa_unsafe_output),
+                color = ErrorText, fontSize = 13.sp,
+            )
+            if (reasonRes != null) {
+                Text(
+                    stringResource(R.string.qa_unsafe_reason, stringResource(reasonRes)),
+                    color = MutedText, fontSize = 11.sp, lineHeight = 15.sp,
+                )
+            }
+        }
         return
     }
     val showSettings = message.kind == "BAD_KEY" || message.kind == "NOT_CONFIGURED" || message.kind == "LLM_DENIED"
@@ -772,10 +828,12 @@ private fun ErrorCard(message: PanelMessage.Error, callbacks: PanelCallbacks) {
         "TIMEOUT" -> stringResource(R.string.panel_err_timeout)
         "RATE_LIMIT" -> stringResource(R.string.panel_err_rate_limit)
         "BALANCE" -> stringResource(R.string.panel_err_balance)
+        "CONTEXT_LENGTH" -> stringResource(R.string.panel_err_context_length)
         "NOT_CONFIGURED" -> stringResource(R.string.panel_empty_title)
         "LLM_DENIED" -> stringResource(R.string.panel_llm_denied)
         else -> stringResource(R.string.panel_err_generic)
     }
+    val diagnostics = message.diagnostics
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -785,21 +843,45 @@ private fun ErrorCard(message: PanelMessage.Error, callbacks: PanelCallbacks) {
             .padding(10.dp),
     ) {
         Text(text, fontSize = 13.sp, color = ErrorText)
-        if (showSettings) {
+        if (diagnostics != null) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(diagnostics, fontSize = 10.sp, lineHeight = 14.sp, color = MutedText, maxLines = 3)
+        }
+        if (message.retryable || diagnostics != null || showSettings) {
             Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                stringResource(R.string.panel_err_go_settings),
-                fontSize = 12.sp,
-                color = ErrorText,
-                fontWeight = FontWeight.SemiBold,
-                modifier = Modifier
-                    .border(1.dp, ErrorBorder, RoundedCornerShape(8.dp))
-                    .background(Surface, RoundedCornerShape(8.dp))
-                    .clickable { callbacks.onOpenSettings() }
-                    .padding(horizontal = 10.dp, vertical = 5.dp),
-            )
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (message.retryable) {
+                    ErrorAction(R.string.panel_err_retry, callbacks::onRetry)
+                }
+                if (diagnostics != null) {
+                    ErrorAction(R.string.panel_err_copy_diagnostics) { callbacks.onCopyDiagnostics(diagnostics) }
+                }
+                if (showSettings) {
+                    ErrorAction(R.string.panel_err_go_settings, callbacks::onOpenSettings)
+                }
+            }
         }
     }
+}
+
+/** 错误卡上的描边按钮(触控高度不小于 48dp) */
+@Composable
+private fun ErrorAction(label: Int, onClick: () -> Unit) {
+    Text(
+        stringResource(label),
+        fontSize = 12.sp,
+        color = ErrorText,
+        fontWeight = FontWeight.SemiBold,
+        modifier = Modifier
+            .heightIn(min = 48.dp)
+            .border(1.dp, ErrorBorder, RoundedCornerShape(8.dp))
+            .background(Surface, RoundedCornerShape(8.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 5.dp),
+    )
 }
 
 @Composable

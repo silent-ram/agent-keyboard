@@ -24,8 +24,11 @@ data class Task(
     val contextBeforeText: String = "",
     val contextAfterText: String = "",
     val clipboardText: String? = null,
-    /** 模型上下文窗口( token 数,缺省 8k;折叠预算 = 50%) */
-    val contextWindowTokens: Int = 8000,
+    /**
+     * 模型上下文窗口(token 数)。0 = 未指定:按「模型设置 → 内置窗口表 → 保守默认」解析,
+     * 见 [com.agentkeyboard.data.model.ModelWindows.resolve]。
+     */
+    val contextWindowTokens: Int = 0,
     /** 📚 知识库开关(面板显示用;kb_search 为 stub,M2 接入本地库后生效) */
     val kbEnabled: Boolean = false,
     /**
@@ -52,30 +55,84 @@ internal fun knowledgeAskTask(
     allowProfileSuggestion = allowProfileSuggestion,
 )
 
-/** 错误信息(面板错误卡;message 为成品文案 key 对应的稳定标识,不携带原始异常文本) */
-data class AgentError(val kind: String, val message: String)
+/**
+ * 错误信息(面板错误卡;[kind] 为稳定分类,[message] 为成品文案 key 对应的稳定标识,不携带原始异常文本)。
+ * [httpStatus]/[providerCode] 只用于调试:状态码与错误体里的错误码/类型标识符,可进界面、诊断信息和日志。
+ */
+data class AgentError(
+    val kind: String,
+    val message: String,
+    /** HTTP 状态码;网络层失败没有状态码时为 null */
+    val httpStatus: Int? = null,
+    /** 服务商错误体里的错误码或类型(仅标识符字符,不含请求内容) */
+    val providerCode: String? = null,
+)
 
 /**
- * 单步追踪(可观测性):一次模型请求或一次工具执行的耗时、token 与结果。
+ * 单步追踪(可观测性):一次模型请求、一次重试或一次工具执行的耗时、token 与结果。
  * 只记录时长与状态,不记录请求/响应正文,避免与现有脱敏策略冲突。
  */
 data class AgentTraceStep(
     val step: Int,
-    /** "llm" 或工具 id */
+    /** [KIND_LLM] / [KIND_RETRY] / [KIND_CONTEXT] / [KIND_REJECTED] / [KIND_JUDGE] / 工具 id */
     val kind: String,
     val elapsedMs: Long,
     val usage: com.agentkeyboard.ai.TokenUsage = com.agentkeyboard.ai.TokenUsage.ZERO,
     val ok: Boolean = true,
     /** 稳定错误码(ToolErrorCodes / AgentError.kind);正常为 null */
     val errorCode: String? = null,
-)
+    /** 仅重试步:第几次重试(从 1 起) */
+    val attempt: Int? = null,
+    /** 仅重试步:被重试那次失败的分类(ErrorKind.name) */
+    val errorKind: String? = null,
+    /** 仅重试步:HTTP 状态码;网络层失败没有状态码时为 null */
+    val httpStatus: Int? = null,
+) {
+    /** 是否为工具执行步(模型请求、重试、上下文收紧、复核与未执行的调用都不算) */
+    val isTool: Boolean get() = kind !in NON_TOOL_KINDS
 
-/** 一轮任务的运行摘要(与终态事件一起下发) */
+    companion object {
+        const val KIND_LLM = "llm"
+        const val KIND_RETRY = "retry"
+        /** 服务端报上下文超长后收紧窗口重发 */
+        const val KIND_CONTEXT = "context"
+        /** 模型发起但没有执行的工具调用:名称无效、工具不存在或本轮未开放、参数不可外发、时间用完 */
+        const val KIND_REJECTED = "rejected"
+        /** 资料命中指令样规则后的模型复核(ContentJudge);ok = 复核结论是「并非注入」 */
+        const val KIND_JUDGE = "judge"
+        private val NON_TOOL_KINDS = setOf(KIND_LLM, KIND_RETRY, KIND_CONTEXT, KIND_REJECTED, KIND_JUDGE)
+    }
+}
+
+/** 循环提前结束的原因(批次 1:收尾回答 / 诊断用) */
+enum class StopReason { STEP_LIMIT, TIME_BUDGET, TOKEN_BUDGET, MODEL_LENGTH, FILTERED }
+
+/**
+ * 一轮任务的运行摘要(与终态事件一起下发)。
+ * [firstTokenMs]/[totalMs]/[retries] 供诊断使用,不进面板文案。
+ */
 data class AgentRunSummary(
     val steps: List<AgentTraceStep> = emptyList(),
     val usage: com.agentkeyboard.ai.TokenUsage = com.agentkeyboard.ai.TokenUsage.ZERO,
+    /** true = 预算耗尽后由无工具收尾请求作答,UI 标注「基于部分信息」 */
+    val partial: Boolean = false,
+    val stopReason: StopReason? = null,
+    /** 从本轮开始到首个 token 的耗时;全程没有收到 token 时为 null */
+    val firstTokenMs: Long? = null,
+    /** 本轮总耗时(不含等待用户确认的时间) */
+    val totalMs: Long = 0L,
 ) {
     val elapsedMs: Long get() = steps.sumOf { it.elapsedMs }
+    val promptTokens: Long get() = usage.promptTokens
+    val completionTokens: Long get() = usage.completionTokens
+    /** 模型调用重试次数(从头重试 + 断流续写) */
+    val retries: Int get() = steps.count { it.kind == AgentTraceStep.KIND_RETRY }
+    /** 因上下文超长收紧窗口重发的次数 */
+    val contextShrinks: Int get() = steps.count { it.kind == AgentTraceStep.KIND_CONTEXT }
+    val llmCalls: Int get() = steps.count { it.kind == AgentTraceStep.KIND_LLM }
+    /** 资料命中指令样规则后交给模型复核的次数 */
+    val judgeCalls: Int get() = steps.count { it.kind == AgentTraceStep.KIND_JUDGE }
+    val toolCalls: Int get() = steps.count { it.isTool }
 
     companion object {
         val EMPTY = AgentRunSummary()
@@ -134,9 +191,16 @@ sealed class AgentEvent {
      */
     data object ContentReset : AgentEvent()
 
+    /**
+     * 模型调用遇到可重试错误(超时/限流/5xx/偶发网络失败),即将在 [delayMs] 后发起第 [attempt] 次重试;
+     * 已经输出过文字时这次重试是续写(保留已上屏内容,从中断处接着写)。
+     * 面板据此显示"网络不稳,重试中…"并把草稿灰显;[kind] 为 HTTP 状态码字符串、"TIMEOUT" 或 "NETWORK"。
+     */
+    data class Retrying(val attempt: Int, val delayMs: Long, val kind: String) : AgentEvent()
+
     data class StepStarted(val call: ToolCall, val step: Int) : AgentEvent()
 
-    /** [flagged] = 工具结果命中注入扫描警示(FR-E4) */
+    /** [flagged] = 这条资料已被隔离(带凭据、超长,或指令样文字且模型复核没有放行),模型拿不到原文 */
     data class StepFinished(val call: ToolCall, val result: ToolResult, val step: Int, val flagged: Boolean = false) : AgentEvent()
 
     /** 确认条出现,agent 挂起等待(不超时、不自动放行) */
@@ -157,6 +221,9 @@ sealed class AgentEvent {
         val reason: String,
         val sessionId: Long,
         val summary: AgentRunSummary = AgentRunSummary.EMPTY,
+        /** 收尾失败时已流出的最佳草稿(与 [content] 相同),避免交付空结果 */
+        val bestDraft: String? = null,
+        val stopReason: StopReason? = null,
     ) : AgentEvent()
 
     data class Failed(val error: AgentError, val sessionId: Long, val summary: AgentRunSummary = AgentRunSummary.EMPTY) : AgentEvent()

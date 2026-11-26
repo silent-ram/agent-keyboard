@@ -350,4 +350,178 @@ class PanelStateTest {
         assertEquals("短标题", PanelReducer.sessionTitle("短标题"))
         assertEquals("(空会话)", PanelReducer.sessionTitle("   "))
     }
+
+    /** 方案 4.3:还没有草稿时,重试提示行占位;后续任何事件到来即消失 */
+    @Test
+    fun `Retrying - 无草稿时提示行占位,后续事件清除`() {
+        var msgs = PanelReducer.onThinking(emptyList())
+        msgs = PanelReducer.apply(msgs, AgentEvent.Retrying(1, 1000L, "TIMEOUT"), "GLM", null)
+        assertEquals(listOf(PanelMessage.RetryNotice), msgs)
+        assertTrue("加载行被提示行取代", msgs.none { it == PanelMessage.Loading })
+
+        msgs = PanelReducer.apply(msgs, AgentEvent.Retrying(2, 2000L, "429"), "GLM", null)
+        assertEquals("连续重试只留一条提示", listOf(PanelMessage.RetryNotice), msgs)
+
+        msgs = PanelReducer.apply(msgs, AgentEvent.ContentDelta("重试后的回答"), "GLM", null)
+        assertTrue(msgs.none { it is PanelMessage.RetryNotice })
+    }
+
+    @Test
+    fun `Retrying - 有流式草稿时保留并标记 retrying,增量后恢复`() {
+        var msgs = PanelReducer.apply(emptyList(), AgentEvent.ContentDelta("半截"), "GLM", null)
+        msgs = PanelReducer.apply(msgs, AgentEvent.Retrying(1, 1000L, "TIMEOUT"), "GLM", null)
+        val draft = msgs.filterIsInstance<PanelMessage.Result>().single()
+        assertEquals("半截", draft.text)
+        assertTrue(draft.streaming)
+        assertTrue("草稿保留并灰显", draft.retrying)
+        assertTrue(msgs.none { it is PanelMessage.RetryNotice })
+
+        msgs = PanelReducer.apply(msgs, AgentEvent.ContentDelta("半截回答"), "GLM", null)
+        val resumed = msgs.filterIsInstance<PanelMessage.Result>().single()
+        assertEquals("半截回答", resumed.text)
+        assertFalse(resumed.retrying)
+    }
+
+    @Test
+    fun `Retrying - 最终失败时提示行与草稿都不残留`() {
+        var msgs = PanelReducer.apply(emptyList(), AgentEvent.ContentDelta("半截"), "GLM", null)
+        msgs = PanelReducer.apply(msgs, AgentEvent.Retrying(1, 1000L, "TIMEOUT"), "GLM", null)
+        msgs = PanelReducer.apply(msgs, AgentEvent.ContentReset, "GLM", null)
+        msgs = PanelReducer.apply(msgs, AgentEvent.Failed(AgentError("TIMEOUT", ""), 1), "GLM", null)
+        assertTrue(msgs.none { it is PanelMessage.Result || it is PanelMessage.RetryNotice })
+        assertEquals("TIMEOUT", msgs.filterIsInstance<PanelMessage.Error>().single().kind)
+    }
+
+    /** 收尾回答:卡片带 partial 标注,面板据此显示「基于部分信息」 */
+    @Test
+    fun `Finished - 收尾回答(summary 的 partial 为 true)时卡片带 partial 标注`() {
+        val summary = com.agentkeyboard.agent.AgentRunSummary(
+            partial = true, stopReason = com.agentkeyboard.agent.StopReason.STEP_LIMIT,
+        )
+        var msgs = PanelReducer.apply(emptyList(), AgentEvent.ContentDelta("收尾回答"), "GLM", null)
+        msgs = PanelReducer.apply(msgs, AgentEvent.Finished("收尾回答", emptyList(), 1, summary = summary), "GLM", 2L)
+        val result = msgs.filterIsInstance<PanelMessage.Result>().single()
+        assertTrue(result.partial)
+        assertFalse(result.streaming)
+
+        val plain = PanelReducer.onFinished(emptyList(), "普通回答", emptyList(), "AI", null)
+        assertFalse(plain.filterIsInstance<PanelMessage.Result>().single().partial)
+    }
+
+    @Test
+    fun `Finished - 重试步不计入工具调用次数`() {
+        val summary = com.agentkeyboard.agent.AgentRunSummary(
+            steps = listOf(
+                com.agentkeyboard.agent.AgentTraceStep(1, "retry", 500, ok = false),
+                com.agentkeyboard.agent.AgentTraceStep(1, "llm", 120),
+                com.agentkeyboard.agent.AgentTraceStep(1, "web_search", 80),
+            ),
+        )
+        val out = PanelReducer.onFinished(emptyList(), "回答", emptyList(), "AI", null, summary = summary)
+        assertTrue(out.filterIsInstance<PanelMessage.Result>().single().metaLine!!.contains("1 次工具调用"))
+    }
+
+    @Test
+    fun `Incomplete - bestDraft 作为可读的结果卡保留`() {
+        var msgs = PanelReducer.apply(emptyList(), AgentEvent.ContentDelta("已有的"), "GLM", null)
+        msgs = PanelReducer.apply(
+            msgs,
+            AgentEvent.Incomplete("已有的", emptyList(), "回答传输中断", 1, bestDraft = "已有的"),
+            "GLM",
+            null,
+        )
+        val result = msgs.filterIsInstance<PanelMessage.Result>().single()
+        assertEquals("已有的", result.text)
+        assertTrue(result.unverified)
+        assertFalse(result.streaming)
+        assertTrue(msgs.filterIsInstance<PanelMessage.System>().single().text.contains("传输中断"))
+    }
+
+    // ==================== 批次 4 / 5:回喂说明、错误卡调试信息、运行阶段 ====================
+
+    /** 方案 5.2:用户拒绝、没轮到执行与真正的执行失败在卡片上分开说 */
+    @Test
+    fun `StepFinished failed - 被拒绝与未执行各有说明`() {
+        val running = listOf<PanelMessage>(
+            PanelMessage.ToolCard("c1", "web_search", "🔍 联网搜索", ToolCardState.RUNNING, "执行中…"),
+        )
+        fun card(raw: String) = PanelReducer.onStepFinished(
+            running, "c1", "web_search", ok = false, raw = raw, citationCount = 0, flagged = false,
+        ).filterIsInstance<PanelMessage.ToolCard>().single()
+        assertEquals("已拒绝", card("user_denied").summary)
+        assertEquals("未执行", card("前序步骤已停止，未执行").summary)
+        assertEquals("执行失败", card("搜索服务无响应").summary)
+    }
+
+    @Test
+    fun `会话载入 - 被拒绝的工具行显示已拒绝`() {
+        val rows = listOf(
+            AgentMessageEntity(
+                sessionId = 1, role = "tool", content = "user_denied",
+                toolJson = """{"toolCallId":"c1","name":"fetch_page","ok":false,"flagged":false}""",
+                stepNo = 1, createdAt = 1,
+            ),
+        )
+        val card = PanelReducer.sessionToPanelMessages(rows, null).filterIsInstance<PanelMessage.ToolCard>().single()
+        assertEquals(ToolCardState.FAILED, card.state)
+        assertEquals("已拒绝", card.summary)
+    }
+
+    @Test
+    fun `Failed - 错误卡带调试信息 可重试的错误才显示重试`() {
+        val summary = com.agentkeyboard.agent.AgentRunSummary(
+            steps = listOf(
+                com.agentkeyboard.agent.AgentTraceStep(1, "retry", 500, ok = false),
+                com.agentkeyboard.agent.AgentTraceStep(1, "llm", 120),
+            ),
+        )
+        var msgs = PanelReducer.onThinking(emptyList())
+        msgs = PanelReducer.onStepStarted(msgs, "c1", "web_search")
+        val out = PanelReducer.onFailed(msgs, AgentError("TIMEOUT", ""), summary)
+        val err = out.filterIsInstance<PanelMessage.Error>().single()
+        assertTrue(err.retryable)
+        assertTrue("调试信息说明分类与重试次数", err.diagnostics!!.startsWith("TIMEOUT") && err.diagnostics.contains("重试 1 次"))
+        assertEquals("运行结束后没有工具卡停在执行中", ToolCardState.FAILED, out.filterIsInstance<PanelMessage.ToolCard>().single().state)
+
+        val badKey = PanelReducer.onFailed(emptyList<PanelMessage>(), AgentError("BAD_KEY", ""))
+            .filterIsInstance<PanelMessage.Error>().single()
+        assertFalse("配置类错误重试也不会好", badKey.retryable)
+    }
+
+    @Test
+    fun `Stopped - 还在执行的工具卡收尾为已停止`() {
+        val msgs = PanelReducer.onStepStarted(emptyList(), "c1", "kb_search")
+        val card = PanelReducer.onStopped(msgs).filterIsInstance<PanelMessage.ToolCard>().single()
+        assertEquals(ToolCardState.FAILED, card.state)
+        assertEquals("已停止", card.summary)
+    }
+
+    @Test
+    fun `runPhase - 按最近的运行中状态取阶段`() {
+        assertEquals(RunPhase.THINKING, PanelReducer.runPhase(PanelReducer.onThinking(emptyList())))
+        var msgs = PanelReducer.onStepStarted(emptyList(), "c1", "kb_search")
+        assertEquals(RunPhase.KNOWLEDGE_SEARCH, PanelReducer.runPhase(msgs))
+        msgs = PanelReducer.onStepStarted(msgs, "c2", "web_search")
+        assertEquals(RunPhase.WEB_SEARCH, PanelReducer.runPhase(msgs))
+        msgs = PanelReducer.onStepFinished(msgs, "c2", "web_search", ok = true, raw = "r", citationCount = 0, flagged = false)
+        assertEquals("搜索完成后回到仍在运行的检索", RunPhase.KNOWLEDGE_SEARCH, PanelReducer.runPhase(msgs))
+        msgs = PanelReducer.onStepFinished(msgs, "c1", "kb_search", ok = true, raw = "r", citationCount = 0, flagged = false)
+        msgs = PanelReducer.apply(msgs, AgentEvent.ContentDelta("回答"), "GLM", null)
+        assertEquals(RunPhase.ANSWER, PanelReducer.runPhase(msgs))
+        msgs = PanelReducer.apply(msgs, AgentEvent.Retrying(1, 1000L, "TIMEOUT"), "GLM", null)
+        assertEquals(RunPhase.RETRYING, PanelReducer.runPhase(msgs))
+    }
+
+    @Test
+    fun `Finished - 未执行与收紧上下文的步骤不计入工具调用次数`() {
+        val summary = com.agentkeyboard.agent.AgentRunSummary(
+            steps = listOf(
+                com.agentkeyboard.agent.AgentTraceStep(1, "web_search", 80, ok = true),
+                com.agentkeyboard.agent.AgentTraceStep(2, com.agentkeyboard.agent.AgentTraceStep.KIND_REJECTED, 0, ok = false),
+                com.agentkeyboard.agent.AgentTraceStep(2, com.agentkeyboard.agent.AgentTraceStep.KIND_CONTEXT, 10, ok = false),
+            ),
+        )
+        val out = PanelReducer.onFinished(emptyList(), "回答", emptyList(), "AI", null, summary = summary)
+        assertTrue(out.filterIsInstance<PanelMessage.Result>().single().metaLine!!.contains("1 次工具调用"))
+    }
 }

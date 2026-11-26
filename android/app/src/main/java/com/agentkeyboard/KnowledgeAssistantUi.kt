@@ -71,6 +71,7 @@ import com.agentkeyboard.agent.AgentEvent
 import com.agentkeyboard.agent.AgentFactory
 import com.agentkeyboard.agent.AgentKit
 import com.agentkeyboard.agent.ConfirmationRequest
+import com.agentkeyboard.agent.RunDiagnostics
 import com.agentkeyboard.agent.Task
 import com.agentkeyboard.agent.TaskType
 import com.agentkeyboard.data.KeyboardHeight
@@ -102,6 +103,10 @@ private data class ChatLine(
     val text: String,
     val citations: List<Citation> = emptyList(),
     val streaming: Boolean = false,
+    /** 重试期间保留的流式草稿(灰显) */
+    val retrying: Boolean = false,
+    /** 预算耗尽后由收尾请求给出的答案:下方标注「基于部分信息」 */
+    val partial: Boolean = false,
 )
 
 class DisclosurePromptHost {
@@ -193,15 +198,25 @@ fun KnowledgeAssistantRoot(
                 is AgentEvent.ContentDelta -> {
                     val last = messages.lastOrNull()
                     if (last?.role == MessageRoles.ASSISTANT && last.streaming) {
-                        messages[messages.lastIndex] = last.copy(text = event.accumulated)
+                        messages[messages.lastIndex] = last.copy(text = event.accumulated, retrying = false)
                     } else {
                         messages.add(ChatLine(MessageRoles.ASSISTANT, event.accumulated, streaming = true))
+                    }
+                }
+                // 重试期间保留流式草稿(灰显);重试结果的首个 ContentDelta 携带完整累积文本,会整体替换
+                is AgentEvent.Retrying -> {
+                    status = context.getString(R.string.qa_status_retrying)
+                    val last = messages.lastOrNull()
+                    if (last?.role == MessageRoles.ASSISTANT && last.streaming) {
+                        messages[messages.lastIndex] = last.copy(retrying = true)
                     }
                 }
                 is AgentEvent.Finished -> {
                     val last = messages.lastOrNull()
                     if (last?.role == MessageRoles.ASSISTANT && last.streaming) messages.removeAt(messages.lastIndex)
-                    messages.add(ChatLine(MessageRoles.ASSISTANT, event.content, event.citations))
+                    messages.add(
+                        ChatLine(MessageRoles.ASSISTANT, event.content, event.citations, partial = event.summary.partial),
+                    )
                     activeSessionId = event.sessionId
                     busy = false
                     status = null
@@ -231,6 +246,12 @@ fun KnowledgeAssistantRoot(
                         messages.removeAt(messages.lastIndex)
                     }
                     messages.add(ChatLine(MessageRoles.SYSTEM, chatErrorText(context, event.error.kind)))
+                    // 拦截类错误再说一句是哪条客观条件不满足(引擎给的是稳定标识,不含内容)
+                    com.agentkeyboard.ime.unsafeReasonRes(event.error.message)
+                        ?.let { messages.add(ChatLine(MessageRoles.SYSTEM, context.getString(R.string.qa_unsafe_reason, context.getString(it)))) }
+                    // 调试信息另起一行:分类、状态码、耗时与计数,不含对话内容
+                    RunDiagnostics.describe(event.error, event.summary).takeIf { it != event.error.kind }
+                        ?.let { messages.add(ChatLine(MessageRoles.SYSTEM, it)) }
                     if (event.error.kind == "NOT_CONFIGURED") page = KnowledgePage.AGENT
                     busy = false
                     status = null
@@ -244,7 +265,9 @@ fun KnowledgeAssistantRoot(
                     status = null
                 }
                 is AgentEvent.ContentReset -> {
-                    // 草稿撤回(检查未通过 / 转入工具调用 / 重试):丢弃未审核的流式半截文字
+                    // 草稿撤回(检查未通过 / 转入工具调用):丢弃未审核的流式半截文字;
+                    // 重试提示随之清掉,后续状态由新事件给出
+                    status = null
                     val last = messages.lastOrNull()
                     if (last?.role == MessageRoles.ASSISTANT && last.streaming) messages.removeAt(messages.lastIndex)
                 }
@@ -616,7 +639,17 @@ private fun ChatLineView(line: ChatLine, onCitation: (Citation) -> Unit) {
         ) {
             // 2026-11-22:回答正文可直接长按选择复制;下方另有显式「复制」按钮
             androidx.compose.foundation.text.selection.SelectionContainer {
-                Text(line.text, color = BodyText, fontSize = 15.sp, lineHeight = 24.sp, textAlign = TextAlign.Start)
+                Text(
+                    line.text,
+                    // 重试期间草稿保留但灰显,表示这段内容还没定稿
+                    color = if (line.retrying) BodyText.copy(alpha = 0.55f) else BodyText,
+                    fontSize = 15.sp,
+                    lineHeight = 24.sp,
+                    textAlign = TextAlign.Start,
+                )
+            }
+            if (line.partial) {
+                Text(stringResource(R.string.panel_partial_hint), color = MutedText, fontSize = 12.sp)
             }
             // 显式复制按钮:历史对话中的旧回答同样保留(与面板端一致)
             AssistantIconButton(
@@ -821,6 +854,7 @@ private fun chatErrorText(context: Context, kind: String): String =
             "TIMEOUT" -> R.string.qa_error_timeout
             "RATE_LIMIT" -> R.string.qa_error_rate_limit
             "BALANCE" -> R.string.qa_error_balance
+            "CONTEXT_LENGTH" -> R.string.panel_err_context_length
             else -> R.string.qa_error_generic
         }
     )

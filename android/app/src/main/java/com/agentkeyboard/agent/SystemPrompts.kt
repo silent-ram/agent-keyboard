@@ -43,6 +43,23 @@ object SystemPrompts {
             "If private facts are absent from the documents, do not guess them from the web. Never invent content or citations, " +
             "and do not claim a search was performed unless the tool returned results."
 
+    /**
+     * 轻量规划(只靠提示,不另发一次模型请求):检索前先想清楚缺什么、用哪个工具、用什么词,
+     * 计划本身不输出——省掉"先说一通再检索"的步骤和 token。
+     */
+    const val LIGHT_PLANNING =
+        "Before searching, decide silently what information is missing, which single tool can provide it, " +
+            "and the shortest precise query for it. Do not search for anything the conversation or retrieved material " +
+            "already answers, and do not search again hoping for a different answer. Never write out a plan; " +
+            "go straight to the search or to the answer."
+
+    /** 回答前自检:逐条对照已取回的资料,区分证据与推断,不把记得或猜到的内容当作证据 */
+    const val SELF_CHECK =
+        "Before answering, check your draft against the material you actually received: every factual claim " +
+            "taken from documents or search results must be traceable to a passage or result returned by a tool. " +
+            "Mark inferences as inferences, say plainly which parts could not be confirmed, and never present " +
+            "remembered, guessed or paraphrased-from-memory details as evidence."
+
     fun build(type: TaskType, contextBefore: String): String = build(type, contextBefore, "")
 
     /** 画像注入上限:user.md 与记忆条数都无界会撑爆上下文窗口,必须截断 */
@@ -103,6 +120,8 @@ object SystemPrompts {
             "Answer in Chinese using the user's question and retrieved knowledge-base passages.",
             "When a question concerns imported material, search the configured knowledge base first and distinguish evidence from inference.",
             "Only claim to have checked current public information if web_search returned results.",
+            LIGHT_PLANNING,
+            SELF_CHECK,
             KB_SEARCH_STRATEGY,
             DATA_BOUNDARY,
             if (contextBefore.isNotBlank()) "Conversation context:\n$contextBefore" else "",
@@ -123,6 +142,8 @@ object SystemPrompts {
             "Answer clearly and concisely in Chinese, using imported documents for private facts and web_search only for public information.",
             "Call kb_search for questions about imported material. Use web_search for current or public facts in the same turn or a follow-up.",
             "If private evidence is missing, say so; public search must not be used to infer private facts. Never invent facts or citations.",
+            LIGHT_PLANNING,
+            SELF_CHECK,
             KB_SEARCH_STRATEGY,
             DATA_BOUNDARY,
             if (contextBefore.isNotBlank()) "Conversation context:\n$contextBefore" else "",
