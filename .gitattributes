@@ -1,3 +1,6 @@
 # 拼音基准词库按字节做 SHA 校验(PinyinBenchmarkTest 钉死哈希),
 # 必须在所有平台保持 LF,禁止 autocrlf 检出时改写换行导致校验失败。
 android/app/src/test/resources/*.tsv text eol=lf
+
+*.kt text eol=lf
+*.kts text eol=lf
