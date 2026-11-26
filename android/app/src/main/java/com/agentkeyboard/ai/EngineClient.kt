@@ -155,11 +155,20 @@ object EngineClient {
         model: String,
         messages: List<EngineMessage>,
         tools: List<ToolSchema>,
+        stream: Boolean = false,
     ): ChatCompletionCreateParams {
         val builder = ChatCompletionCreateParams.builder()
             .model(com.openai.models.ChatModel.of(model))
         messages.forEach { builder.addMessage(toParam(it)) }
         if (tools.isNotEmpty()) tools.forEach { builder.addTool(toFunctionTool(it)) }
+        if (stream) {
+            // 流式下服务端只在 include_usage=true 时于末尾帧返回 usage(token-trace #1)
+            builder.streamOptions(
+                com.openai.models.chat.completions.ChatCompletionStreamOptions.builder()
+                    .includeUsage(true)
+                    .build()
+            )
+        }
         return builder.build()
     }
 
@@ -196,7 +205,7 @@ object EngineClient {
         // M1 批次 3:每次调用开始清残留取消标志(单例 handle 跨任务复用,标志不清会让新任务启动即被杀)
         handle.cancelRequested = false
         val response: StreamResponse<ChatCompletionChunk> =
-            client.chat().completions().createStreaming(buildParams(model, messages, tools))
+            client.chat().completions().createStreaming(buildParams(model, messages, tools, stream = true))
         handle.cancelFn = { runCatching { response.close() } }
         if (handle.cancelRequested) {
             // cancel 先于流建立到达(建连期取消):流一旦建立立即关闭并中止
